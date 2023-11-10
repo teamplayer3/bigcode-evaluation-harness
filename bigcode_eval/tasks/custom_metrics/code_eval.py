@@ -126,6 +126,7 @@ LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
 THE SOFTWARE."""
 
+
 def compute_code_eval(predictions, references, k=[1, 10, 100], num_workers=4, timeout=3.0):
     """Returns the scores"""
 
@@ -133,7 +134,8 @@ def compute_code_eval(predictions, references, k=[1, 10, 100], num_workers=4, ti
         raise ValueError(_WARNING)
 
     if os.name == "nt":
-        raise NotImplementedError("This metric is currently not supported on Windows.")
+        raise NotImplementedError(
+            "This metric is currently not supported on Windows.")
 
     with ThreadPoolExecutor(max_workers=num_workers) as executor:
         futures = []
@@ -152,7 +154,8 @@ def compute_code_eval(predictions, references, k=[1, 10, 100], num_workers=4, ti
 
         for future in as_completed(futures):
             result = future.result()
-            results[result["task_id"]].append((result["completion_id"], result))
+            results[result["task_id"]].append(
+                (result["completion_id"], result))
 
     total, correct = [], []
     for result in results.values():
@@ -166,7 +169,8 @@ def compute_code_eval(predictions, references, k=[1, 10, 100], num_workers=4, ti
     ks = k
     if not isinstance(ks, (list, tuple)):
         ks = [ks]
-    pass_at_k = {f"pass@{k}": estimate_pass_at_k(total, correct, k).mean() for k in ks if (total >= k).all()}
+    pass_at_k = {
+        f"pass@{k}": estimate_pass_at_k(total, correct, k).mean() for k in ks if (total >= k).all()}
 
     return pass_at_k, results
 

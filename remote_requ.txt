@@ -1,0 +1,4 @@
+jsonlines
+termcolor
+cdifflib
+camel_converter

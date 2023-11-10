@@ -82,7 +82,20 @@ def get_prompt_synthesize(doc, language="python"):
     # return doc["instruction"] + "\n" + addon # Results in worse performance for GPT4
 
     # Problem: Difficult for problems that have helper functions
-    return doc["instruction"]
+
+    # Code LLAMA
+    def prompt_template(instruction: str, context: str, function_start: str) -> str:
+        return f"[INST] {instruction}\n[/INST]\n"
+
+    # For octocoder
+    # def prompt_template(instruction: str, context: str, function_start: str) -> str:
+    #     return f"Question: {instruction}\n{context}\n\nAnswer:\n{function_start}"
+
+    # For wizardcoder
+    # def prompt_template(instruction: str, context: str, function_start: str) -> str:
+    #     return f"Below is an instruction that describes a task. Write a response that appropriately completes the request.\n\n### Instruction:\n{instruction}\n\n### Response:"
+
+    return prompt_template(doc["instruction"], "", "")
 
 
 def get_base_prompt_fix(doc, language="python", mode="tests"):
@@ -145,9 +158,6 @@ class ContentParser:
         ]
 
     def __call__(self, prompt: str, content: str, entry_point: str):
-        # NOTE: Model doesn't follow instructions directly:
-        # adds description of change and sometimes fixes
-        # typos, or other "bugs" in description.
         if "```" in content:
             content = content.split("```")[1]
         # first parse with assumption that content has description
@@ -163,43 +173,95 @@ class ContentParser:
         raise ParseError(f"Prompt is not in content:\n{content}")
 
 
-class ChatWrapper:
+def call_anyscale_api(prompt: str, temperature: float) -> str:
 
-    def __init__(self, model: str):
-        self._model = model
+    import requests
 
-    def __call__(self, prompt: str, n: int) -> str:
-        messages = [
-            {
-                "role": "user",
-                "content": prompt,
-            }
-        ]
+    s = requests.Session()
+
+    BEARER = "esecret_pea3m6uymn3rlp1v57hmn3ctqc"
+    url = "https://api.endpoints.anyscale.com/v1/chat/completions"
+    body = {
+        "model": "codellama/CodeLlama-34b-Instruct-hf",
+        "messages": [{"role": "user", "content": prompt}],
+        "temperature": temperature,
+        "max_tokens": 512,
+        "top_p": 0.95,
+    }
+
+    response = s.post(
+        url, headers={"Authorization": f"Bearer {BEARER}"}, json=body)
+
+    if response.status_code != 200:
+        raise Exception(response.text)
+
+    return response.json()["choices"][0]["message"]["content"]
+
+
+def call_huggingface_api(url: str, prompt: str, temperature: str) -> str:
+    import requests
+
+    BEARER = "tEwqBLUbErqsmwkcqfHfbBXjrxSlAGVaPQLLwIUlWPQHZZAYWYzgAJXWtamYFgioQnUeYfMLDXUdolleQIHbQKaCKHdSCothEQcHDUTJGusyUXTnCGPkknpdTJICVRhi"
+
+    headers = {
+        "Authorization": f"Bearer {BEARER}",
+        "Content-Type": "application/json"
+    }
+
+    response = requests.post(url, headers=headers, json={
+        "inputs": prompt,
+        "parameters": {
+            "top_p": 0.95,
+            "temperature": temperature,
+            "repetition_penalty": 1.15,
+            "max_new_tokens": 512,
+            "do_sample": True,
+            "max_time": None,
+            "return_full_text": False,
+        },
+        "options": {
+            "use_cache": False,
+            "wait_for_model": True,
+        }
+    })
+
+    if response.status_code != 200:
+        raise Exception(response.text)
+
+    return response.json()[0]["generated_text"]
+
+
+class ApiWrapper:
+
+    def __init__(self, endpoint_url: str):
+        self.endpoint_url = endpoint_url
+
+    def __call__(self, prompt: str, n: int) -> [str]:
+
         while True:
             try:
-                response = openai.ChatCompletion.create(
-                    model=self._model,
-                    messages=messages,
-                    temperature=0.2,
-                    top_p=0.95,
-                    n=n
-                )
                 content_list = list()
                 for i in range(n):
-                    message = response["choices"][i]["message"]
-                    assert message["role"] == "assistant"
-                    content_list.append(message["content"])
+                    print(f"Generate sample {i} for task...")
+
+                    response = call_anyscale_api(prompt, 0.2)
+
+                    content_list.append(response)
                 return content_list
             except Exception as e:
                 print("API EXCEPTION:", e)
 
 
 if __name__ == '__main__':
-    TIMES = 1
+    TIMES = 20
     VERBOSE = True
     LANGUAGE = "rust"
-    MODEL = "gpt-4-0613"
+    # wizardcoder
+    # ENDPOINT_URL = "https://xy32vdwpo5jeptys.us-east-1.aws.endpoints.huggingface.cloud"
+    # octocoder
+    ENDPOINT_URL = "https://me9rxdof1htyppbi.us-east-1.aws.endpoints.huggingface.cloud"
     TASK = "humanevalsynthesize"
+    RESULT_FILENAME = f"completions_{LANGUAGE}_{TASK}.jsonl"
 
     # Load descriptions
     if TASK == "humanevalexplainsynthesize":
@@ -212,7 +274,7 @@ if __name__ == '__main__':
     samples = [s for s in load_dataset(
         "bigcode/humanevalpack", LANGUAGE)["test"]]
 
-    chat_wrapper = ChatWrapper(MODEL)
+    api_wrapper = ApiWrapper(ENDPOINT_URL)
     parse_errors = 0
     parser = ContentParser()
     for idx, sample in enumerate(tqdm(samples)):
@@ -223,7 +285,7 @@ if __name__ == '__main__':
         elif TASK == "humanevalexplaindescribe":
             prompt, docstring_len = get_prompt_explain_desc(
                 sample, language=LANGUAGE)
-            gen = chat_wrapper(prompt, TIMES)
+            gen = api_wrapper(prompt, TIMES)
             sample["raw_generation"] = gen
             sample["generation"] = [gen_item[:docstring_len]
                                     for gen_item in gen]
@@ -234,14 +296,20 @@ if __name__ == '__main__':
         if VERBOSE:
             print(
                 f"Processing {sample['task_id']} ({idx + 1}/{len(samples)}))...")
-        sample["raw_generation"] = chat_wrapper(prompt, TIMES)
-        try:
-            sample["generation"] = [parser(prompt, generation_item, sample["entry_point"])
-                                    for generation_item in sample["raw_generation"]]
-        except ParseError as e:
-            parse_errors += 1
-            print("PARSE EXCEPTION:", e)
-            sample["generation"] = [""]
+        sample["raw_generation"] = api_wrapper(prompt, TIMES)
+
+        parsed_samples = list()
+        for generation_item in sample["raw_generation"]:
+            try:
+                parsed_samples.append(
+                    parser(prompt, generation_item, sample["entry_point"]))
+            except ParseError as e:
+                parse_errors += 1
+                print("PARSE EXCEPTION:", e)
+                parsed_samples.append("")
+
+        sample["generation"] = parsed_samples
+
         if VERBOSE:
             for i in range(TIMES):
                 print(termcolor.colored(
@@ -250,9 +318,12 @@ if __name__ == '__main__':
                 print(termcolor.colored(sample["canonical_solution"], "red"))
                 print(termcolor.colored(
                     sample["generation"][i], "green")+"\n\n")
+
+        with jsonlines.open(RESULT_FILENAME, "w") as writer:
+            writer.write_all(samples)
+
     if VERBOSE:
         print("parse error rate:", parse_errors / len(samples))
 
-    results_filename = f"completions_{LANGUAGE}_{TASK}.jsonl"
-    with jsonlines.open(results_filename, "w") as writer:
+    with jsonlines.open(RESULT_FILENAME, "w") as writer:
         writer.write_all(samples)

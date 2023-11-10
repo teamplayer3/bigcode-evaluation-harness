@@ -4,7 +4,7 @@ import os
 import warnings
 
 from bigcode_eval import tasks
-from bigcode_eval.generation import parallel_generations
+from bigcode_eval.generation import parallel_generations, remote_generations
 
 _WARNING = """
 ################################################################################
@@ -43,11 +43,13 @@ class Evaluator:
         dataset = task.get_dataset()
         # if args.limit is None, use all samples
         n_tasks = self.args.limit if self.args.limit else len(dataset)
-        references = [task.get_reference(dataset[i]) for i in range(self.args.limit_start, self.args.limit_start+n_tasks)]
+        references = [task.get_reference(dataset[i]) for i in range(
+            self.args.limit_start, self.args.limit_start+n_tasks)]
 
         if self.args.check_references:
             if "get_solution" in inspect.signature(task.get_reference).parameters:
-                solutions = [[task.get_reference(dataset[i], get_solution=True)] for i in range(self.args.limit_start, self.args.limit_start+n_tasks)]
+                solutions = [[task.get_reference(dataset[i], get_solution=True)] for i in range(
+                    self.args.limit_start, self.args.limit_start+n_tasks)]
             else:
                 solutions = [[ref] for ref in references]
             return solutions, references
@@ -95,3 +97,72 @@ class Evaluator:
             print("Evaluating generations...")
             results = task.process_results(generations, references)
             return results
+
+
+class RemoteEvaluator:
+    def __init__(self, endpoint, args):
+        self.endpoint = endpoint
+        self.args = args
+
+        # setup arguments
+        self.metric_output_path = args.metric_output_path
+
+        # code evaluation permission
+        self.allow_code_execution = args.allow_code_execution
+
+    def generate_text(self, task_name):
+        task = tasks.get_task(task_name, self.args)
+        dataset = task.get_dataset()
+        # if args.limit is None, use all samples
+        n_tasks = self.args.limit if self.args.limit else len(dataset)
+        references = [task.get_reference(dataset[i]) for i in range(
+            self.args.limit_start, self.args.limit_start+n_tasks)]
+
+        if self.args.check_references:
+            if "get_solution" in inspect.signature(task.get_reference).parameters:
+                solutions = [[task.get_reference(dataset[i], get_solution=True)] for i in range(
+                    self.args.limit_start, self.args.limit_start+n_tasks)]
+            else:
+                solutions = [[ref] for ref in references]
+            return solutions, references
+
+        generations = remote_generations(
+            task,
+            self.endpoint,
+            dataset,
+            n_tasks=n_tasks,
+            args=self.args,
+        )
+        if len(generations[0]) > self.args.n_samples:
+            generations = [l[: self.args.n_samples] for l in generations]
+            warnings.warn(
+                f"Number of tasks wasn't proportional to number of devices, we removed extra predictions to only keep nsamples={self.args.n_samples}"
+            )
+        return generations, references
+
+    def evaluate(self, task_name):
+        task = tasks.get_task(task_name, self.args)
+        if task.requires_execution and not self.allow_code_execution:
+            raise ValueError(_WARNING)
+
+        generations, references = self.generate_text(task_name)
+
+        if not self.args.load_generations_path:
+            if self.args.save_generations:
+                with open(self.args.save_generations_path, "w") as fp:
+                    json.dump(generations, fp)
+                    print(
+                        f"generations were saved at {self.args.save_generations_path}"
+                    )
+            if self.args.save_references:
+                with open("references.json", "w") as fp:
+                    json.dump(references, fp)
+                    print("references were saved at references.json")
+
+        # make sure tokenizer plays nice with multiprocessing
+        os.environ["TOKENIZERS_PARALLELISM"] = "false"
+        if self.allow_code_execution and task.requires_execution:
+            os.environ["HF_ALLOW_CODE_EVAL"] = "1"
+        print("Evaluating generations...")
+        results = task.process_results(generations, references)
+        return results

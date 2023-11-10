@@ -1,0 +1,1 @@
+python3 main.py --allow_code_execution --load_generations_path completions_python_humanevalsynthesize_conf.jsonl --temperature 0.2 --tasks humanevalsynthesize-python --n_samples 164

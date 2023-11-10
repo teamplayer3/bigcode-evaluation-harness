@@ -39,6 +39,8 @@ import os
 import openai
 import jsonlines
 import termcolor
+import asyncio
+import aiohttp
 
 from cdifflib import CSequenceMatcher
 from camel_converter import to_snake
@@ -64,6 +66,8 @@ LANGUAGE_TO_NAME = {
     "rust": "Rust",
 }
 
+LLM_TYPE = "OCTOCODER"  # "OCTOCODER", "CODE_LLAMA"
+
 
 def get_prompt_base(doc, language):
     # See
@@ -78,11 +82,28 @@ def get_prompt_base(doc, language):
 
 
 def get_prompt_synthesize(doc, language="python"):
+    global LLM_TYPE
     # addon = f"Start your code with:\n{get_prompt_base(sample, language)}"
     # return doc["instruction"] + "\n" + addon # Results in worse performance for GPT4
 
     # Problem: Difficult for problems that have helper functions
-    return doc["instruction"]
+
+    # Code LLAMA
+    if LLM_TYPE == "CODE_LLAMA":
+        def prompt_template(instruction: str, context: str, function_start: str) -> str:
+            return f"[INST] {instruction}\n[/INST]\n"
+
+    # For octocoder
+    if LLM_TYPE == "OCTOCODER":
+        def prompt_template(instruction: str, context: str, function_start: str) -> str:
+            return f"Question: {instruction}\n{context}\n\nAnswer:\n{function_start}"
+
+    # For wizardcoder
+    if LLM_TYPE == "WIZARD_CODER":
+        def prompt_template(instruction: str, context: str, function_start: str) -> str:
+            return f"Below is an instruction that describes a task. Write a response that appropriately completes the request.\n\n### Instruction:\n{instruction}\n\n### Response:"
+
+    return prompt_template(doc["instruction"], "", doc["prompt"])
 
 
 def get_base_prompt_fix(doc, language="python", mode="tests"):
@@ -144,62 +165,149 @@ class ContentParser:
             entry_point[0].lower() + entry_point[1:],
         ]
 
-    def __call__(self, prompt: str, content: str, entry_point: str):
-        # NOTE: Model doesn't follow instructions directly:
-        # adds description of change and sometimes fixes
-        # typos, or other "bugs" in description.
+    def __call__(self, prompt: str, content: str, entry_point: str, language: str = "python"):
         if "```" in content:
             content = content.split("```")[1]
         # first parse with assumption that content has description
-        matcher = CSequenceMatcher(None, prompt, content)
-        tag, _, _, j1, j2 = matcher.get_opcodes()[-1]
-        if tag == "insert":
-            return content[j1:j2]
+        # matcher = CSequenceMatcher(None, prompt, content)
+        # tag, _, _, j1, j2 = matcher.get_opcodes()[-1]
+        # if tag == "insert":
+        #     return content[j1:j2]
         # second parse content with assumption that model wrote code without description
         for entry_point in self._entry_point_variations(entry_point):
             if entry_point in content:
-                content = content.split(entry_point)[-1]
-                return "".join(content.splitlines(keepends=True)[1:])
+                content = content.split("fn " + entry_point)[-1]
+
+        if language == "python":
+            content_lines = content.splitlines(keepends=True)[1:]
+            func_lines = []
+            for line in content_lines:
+                if line.startswith("    ") or line.startswith("\n"):
+                    func_lines.append(line)
+                else:
+                    break
+            content = "".join(func_lines)
+        elif language == "rust":
+            open_brackets = 1
+            in_string = False
+
+            for idx, char in enumerate(content):
+                if char == '"':
+                    in_string = not in_string
+                if not in_string:
+                    if char == '{':
+                        open_brackets += 1
+                    elif char == '}':
+                        open_brackets -= 1
+
+                if open_brackets == 0:
+                    content = content[:idx + 1]
+                    break
+
+        return content
         raise ParseError(f"Prompt is not in content:\n{content}")
 
 
-class ChatWrapper:
+async def post(session: aiohttp.ClientSession, url: str, headers=dict, body=dict):
+    try:
+        async with session.post(url=url, headers=headers, json=body) as response:
 
-    def __init__(self, model: str):
-        self._model = model
+            if response.status != 200:
+                raise Exception(response.text)
 
-    def __call__(self, prompt: str, n: int) -> str:
-        messages = [
-            {
-                "role": "user",
-                "content": prompt,
-            }
-        ]
+            return await response.json()
+    except Exception as e:
+        print("Unable to get url {} due to {}.".format(url, e))
+
+
+async def call_anyscale_api(session: aiohttp.ClientSession, prompt: str, temperature: float) -> str:
+
+    BEARER = "esecret_pea3m6uymn3rlp1v57hmn3ctqc"
+    url = "https://api.endpoints.anyscale.com/v1/chat/completions"
+    body = {
+        "model": "codellama/CodeLlama-34b-Instruct-hf",
+        "messages": [{"role": "user", "content": prompt}],
+        "temperature": temperature,
+        "max_tokens": 512,
+        "top_p": 0.95,
+    }
+
+    response = await post(session,
+                          url, headers={"Authorization": f"Bearer {BEARER}"}, json=body)
+
+    return response["choices"][0]["message"]["content"]
+
+
+async def call_huggingface_api(session: aiohttp.ClientSession, url: str, prompt: str, temperature: str) -> str:
+
+    BEARER = "tEwqBLUbErqsmwkcqfHfbBXjrxSlAGVaPQLLwIUlWPQHZZAYWYzgAJXWtamYFgioQnUeYfMLDXUdolleQIHbQKaCKHdSCothEQcHDUTJGusyUXTnCGPkknpdTJICVRhi"
+    headers = {
+        "Authorization": f"Bearer {BEARER}",
+        "Content-Type": "application/json"
+    }
+    body = {
+        "inputs": prompt,
+        "parameters": {
+            "top_p": 0.95,
+            "temperature": temperature,
+            "repetition_penalty": 1.15,
+            "max_new_tokens": 512,
+            "do_sample": True,
+            "max_time": None,
+            "return_full_text": False,
+        },
+        "options": {
+            "use_cache": False,
+            "wait_for_model": True,
+        }
+    }
+
+    response = await post(session, url, headers=headers, body=body)
+
+    return response[0]["generated_text"]
+
+
+class ApiWrapper:
+
+    def __init__(self, endpoint_url: str, temperature: float):
+        self.endpoint_url = endpoint_url
+        self.temperature = temperature
+
+    async def __call__(self, prompt: str, n: int) -> [str]:
+        global LLM_TYPE
+
         while True:
             try:
-                response = openai.ChatCompletion.create(
-                    model=self._model,
-                    messages=messages,
-                    temperature=0.2,
-                    top_p=0.95,
-                    n=n
-                )
-                content_list = list()
-                for i in range(n):
-                    message = response["choices"][i]["message"]
-                    assert message["role"] == "assistant"
-                    content_list.append(message["content"])
-                return content_list
+                async with aiohttp.ClientSession() as session:
+                    if LLM_TYPE == "WIZARD_CODER" or LLM_TYPE == "OCTOCODER":
+                        content_list = await asyncio.gather(*[call_huggingface_api(
+                            session, self.endpoint_url, prompt, self.temperature) for _ in range(n)])
+                    if LLM_TYPE == "CODE_LLAMA":
+                        content_list = await asyncio.gather(*[call_anyscale_api(
+                            session, prompt, self.temperature) for _ in range(n)])
+
+                    return content_list
             except Exception as e:
                 print("API EXCEPTION:", e)
 
 
-if __name__ == '__main__':
-    TIMES = 1
+async def main():
+    global LLM_TYPE
+
+    START_TASK = 0
+
+    TIMES = 20
     VERBOSE = True
     LANGUAGE = "rust"
-    MODEL = "gpt-4-0613"
+    TEMPERATURE = 0.2
+    # wizardcoder
+    if LLM_TYPE == "WIZARD_CODER":
+        ENDPOINT_URL = "https://xy32vdwpo5jeptys.us-east-1.aws.endpoints.huggingface.cloud"
+    # octocoder
+    if LLM_TYPE == "OCTOCODER":
+        ENDPOINT_URL = "https://me9rxdof1htyppbi.us-east-1.aws.endpoints.huggingface.cloud"
     TASK = "humanevalsynthesize"
+    RESULT_FILENAME = f"completions_{LANGUAGE}_{TASK}.jsonl"
 
     # Load descriptions
     if TASK == "humanevalexplainsynthesize":
@@ -212,10 +320,13 @@ if __name__ == '__main__':
     samples = [s for s in load_dataset(
         "bigcode/humanevalpack", LANGUAGE)["test"]]
 
-    chat_wrapper = ChatWrapper(MODEL)
+    api_wrapper = ApiWrapper(ENDPOINT_URL, TEMPERATURE)
     parse_errors = 0
     parser = ContentParser()
     for idx, sample in enumerate(tqdm(samples)):
+        if idx < START_TASK:
+            continue
+
         if TASK == "humanevalfix":
             prompt = get_prompt_fix(sample, language=LANGUAGE, mode="tests")
         elif TASK == "humanevalsynthesize":
@@ -223,7 +334,7 @@ if __name__ == '__main__':
         elif TASK == "humanevalexplaindescribe":
             prompt, docstring_len = get_prompt_explain_desc(
                 sample, language=LANGUAGE)
-            gen = chat_wrapper(prompt, TIMES)
+            gen = await api_wrapper(prompt, TIMES)
             sample["raw_generation"] = gen
             sample["generation"] = [gen_item[:docstring_len]
                                     for gen_item in gen]
@@ -234,14 +345,20 @@ if __name__ == '__main__':
         if VERBOSE:
             print(
                 f"Processing {sample['task_id']} ({idx + 1}/{len(samples)}))...")
-        sample["raw_generation"] = chat_wrapper(prompt, TIMES)
-        try:
-            sample["generation"] = [parser(prompt, generation_item, sample["entry_point"])
-                                    for generation_item in sample["raw_generation"]]
-        except ParseError as e:
-            parse_errors += 1
-            print("PARSE EXCEPTION:", e)
-            sample["generation"] = [""]
+        sample["raw_generation"] = await api_wrapper(prompt, TIMES)
+
+        parsed_samples = list()
+        for generation_item in sample["raw_generation"]:
+            try:
+                parsed_samples.append(
+                    parser(prompt, generation_item, sample["entry_point"]))
+            except ParseError as e:
+                parse_errors += 1
+                print("PARSE EXCEPTION:", e)
+                parsed_samples.append("")
+
+        sample["generation"] = parsed_samples
+
         if VERBOSE:
             for i in range(TIMES):
                 print(termcolor.colored(
@@ -250,9 +367,15 @@ if __name__ == '__main__':
                 print(termcolor.colored(sample["canonical_solution"], "red"))
                 print(termcolor.colored(
                     sample["generation"][i], "green")+"\n\n")
+
+        with jsonlines.open(RESULT_FILENAME, "w") as writer:
+            writer.write_all(samples)
+
     if VERBOSE:
         print("parse error rate:", parse_errors / len(samples))
 
-    results_filename = f"completions_{LANGUAGE}_{TASK}.jsonl"
-    with jsonlines.open(results_filename, "w") as writer:
+    with jsonlines.open(RESULT_FILENAME, "w") as writer:
         writer.write_all(samples)
+
+if __name__ == '__main__':
+    asyncio.run(main())
