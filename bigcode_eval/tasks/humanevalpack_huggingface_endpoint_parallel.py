@@ -66,7 +66,7 @@ LANGUAGE_TO_NAME = {
     "rust": "Rust",
 }
 
-LLM_TYPE = "OCTOCODER"  # "OCTOCODER", "CODE_LLAMA"
+LLM_TYPE = "CODE_LLAMA"  # "OCTOCODER", "CODE_LLAMA", "CODE_LLAMA_7B"
 
 
 def get_prompt_base(doc, language):
@@ -89,9 +89,11 @@ def get_prompt_synthesize(doc, language="python"):
     # Problem: Difficult for problems that have helper functions
 
     # Code LLAMA
-    if LLM_TYPE == "CODE_LLAMA":
+    if LLM_TYPE == "CODE_LLAMA" or LLM_TYPE == "CODE_LLAMA_7B":
         def prompt_template(instruction: str, context: str, function_start: str) -> str:
-            return f"[INST] {instruction}\n[/INST]\n"
+            # sys_instruct = "Below is a task description. Write code in idiomatic Rust, by using iterators, match operator, pattern matching, build in std functions, returning values without using `return`, use sage integer operators like `checked_add`, use `?` for error handling, use Option or Result for failed operations, naming convention, that completes the task."
+            # return f"<s>[INST] <<SYS>>\n{sys_instruct}\n<</SYS>>\n\n{instruction}\n{function_start}[/INST]"
+            return f"<s>[INST] {instruction}[/INST]"
 
     # For octocoder
     if LLM_TYPE == "OCTOCODER":
@@ -166,6 +168,12 @@ class ContentParser:
         ]
 
     def __call__(self, prompt: str, content: str, entry_point: str, language: str = "python"):
+        raw_content = content
+
+        # remove comments
+        content = "".join(filter(lambda x: not x.startswith(
+            "//"), content.splitlines(keepends=True)))
+
         if "```" in content:
             content = content.split("```")[1]
         # first parse with assumption that content has description
@@ -174,9 +182,6 @@ class ContentParser:
         # if tag == "insert":
         #     return content[j1:j2]
         # second parse content with assumption that model wrote code without description
-        for entry_point in self._entry_point_variations(entry_point):
-            if entry_point in content:
-                content = content.split("fn " + entry_point)[-1]
 
         if language == "python":
             content_lines = content.splitlines(keepends=True)[1:]
@@ -188,24 +193,81 @@ class ContentParser:
                     break
             content = "".join(func_lines)
         elif language == "rust":
+            start_idx = 0
+            end_idx = 0
             open_brackets = 1
             in_string = False
+            in_char_string = False
+            char_str_len = 0
+            content_out = ""
+            in_func = True
+            cycle_buf = ""
+            wait_for_func_start = False
 
             for idx, char in enumerate(content):
-                if char == '"':
-                    in_string = not in_string
-                if not in_string:
-                    if char == '{':
-                        open_brackets += 1
-                    elif char == '}':
-                        open_brackets -= 1
+                if in_func:
+                    last_was_escape = len(
+                        cycle_buf) == 0 or not cycle_buf[-1] == "\\"
 
-                if open_brackets == 0:
-                    content = content[:idx + 1]
-                    break
+                    if not in_char_string and not last_was_escape and char == '"':
+                        in_string = not in_string
+
+                    if not in_string and not not last_was_escape and char == "'":
+                        char_str_len = 0
+                        in_char_string = not in_char_string
+
+                    if in_char_string:
+                        char_str_len += 1
+                        if char_str_len == 3:
+                            in_char_string = False
+                            char_str_len = 0
+
+                    if not in_string and not in_char_string:
+                        if char == '{':
+                            open_brackets += 1
+                        elif char == '}':
+                            open_brackets -= 1
+
+                    if open_brackets == 0:
+                        end_idx = idx
+                        in_func = False
+                else:
+                    if cycle_buf[-2:] + char == "\nfn":
+                        wait_for_func_start = True
+
+                    if wait_for_func_start and char == "{":
+                        open_brackets += 1
+                        wait_for_func_start = False
+                        in_func = True
+
+                content_out += char
+
+                if len(cycle_buf) > 3:
+                    cycle_buf = cycle_buf[1:]
+                cycle_buf += char
+
+            content = content_out[start_idx:end_idx + 1]
+
+        # split at func start
+        for entry_point in self._entry_point_variations(entry_point):
+            if entry_point in content:
+                if language == "python":
+                    func_prefix = "def"
+                elif language == "rust":
+                    func_prefix = "fn"
+
+                parts = content.split(f"{func_prefix} {entry_point}")
+                if len(parts) > 1:
+                    content = "".join(parts[1].splitlines(keepends=True)[1:])
+
+                parts = content.split(f"{func_prefix} main")
+                if len(parts) > 1:
+                    content = parts[0]
+
+        if len(content.strip()) == 0:
+            raise ParseError(f"Prompt is not in content:\n{raw_content}")
 
         return content
-        raise ParseError(f"Prompt is not in content:\n{content}")
 
 
 async def post(session: aiohttp.ClientSession, url: str, headers=dict, body=dict):
@@ -233,7 +295,7 @@ async def call_anyscale_api(session: aiohttp.ClientSession, prompt: str, tempera
     }
 
     response = await post(session,
-                          url, headers={"Authorization": f"Bearer {BEARER}"}, json=body)
+                          url, headers={"Authorization": f"Bearer {BEARER}"}, body=body)
 
     return response["choices"][0]["message"]["content"]
 
@@ -279,7 +341,7 @@ class ApiWrapper:
         while True:
             try:
                 async with aiohttp.ClientSession() as session:
-                    if LLM_TYPE == "WIZARD_CODER" or LLM_TYPE == "OCTOCODER":
+                    if LLM_TYPE == "WIZARD_CODER" or LLM_TYPE == "OCTOCODER" or LLM_TYPE == "CODE_LLAMA_7B":
                         content_list = await asyncio.gather(*[call_huggingface_api(
                             session, self.endpoint_url, prompt, self.temperature) for _ in range(n)])
                     if LLM_TYPE == "CODE_LLAMA":
@@ -300,14 +362,20 @@ async def main():
     VERBOSE = True
     LANGUAGE = "rust"
     TEMPERATURE = 0.2
+    ENDPOINT_URL = None
     # wizardcoder
     if LLM_TYPE == "WIZARD_CODER":
         ENDPOINT_URL = "https://xy32vdwpo5jeptys.us-east-1.aws.endpoints.huggingface.cloud"
     # octocoder
     if LLM_TYPE == "OCTOCODER":
-        ENDPOINT_URL = "https://me9rxdof1htyppbi.us-east-1.aws.endpoints.huggingface.cloud"
+        ENDPOINT_URL = "https://faidngpb26hefmo4.us-east-1.aws.endpoints.huggingface.cloud"
+        # ENDPOINT_URL = "https://me9rxdof1htyppbi.us-east-1.aws.endpoints.huggingface.cloud"
+    if LLM_TYPE == "CODE_LLAMA_7B":
+        # ENDPOINT_URL = "https://b9al2eru8mdlz5uo.us-east-1.aws.endpoints.huggingface.cloud"
+        ENDPOINT_URL = ""
     TASK = "humanevalsynthesize"
     RESULT_FILENAME = f"completions_{LANGUAGE}_{TASK}.jsonl"
+    # RESULT_FILENAME = "/home/al9hu7/workspace/ma/generated-data/humaneval-rust-samples/completions_rust_humanevalsynthesize_codellama_instruct_34b_t0.2_tp0.95.jsonl"
 
     # Load descriptions
     if TASK == "humanevalexplainsynthesize":
@@ -317,11 +385,34 @@ async def main():
     openai.organization = os.getenv("OPENAI_ORGANIZATION")
     openai.api_key = os.getenv("OPENAI_API_KEY")
 
-    samples = [s for s in load_dataset(
-        "bigcode/humanevalpack", LANGUAGE)["test"]]
+    if START_TASK > 0:
+        with jsonlines.open(RESULT_FILENAME, "r") as reader:
+            samples = [s for s in reader]
+
+        bench = [s for s in load_dataset(
+            "bigcode/humanevalpack", LANGUAGE)["test"]]
+
+        out_samples = []
+
+        bench_iter = bench.__iter__()
+
+        for line in samples:
+            out_samples.append(line)
+            bench_iter.__next__()
+
+        for line in bench_iter:
+            out_samples.append(line)
+
+        samples = out_samples
+    else:
+        samples = [s for s in load_dataset(
+            "bigcode/humanevalpack", LANGUAGE)["test"]]
 
     api_wrapper = ApiWrapper(ENDPOINT_URL, TEMPERATURE)
     parse_errors = 0
+
+    errors_per_sample = []
+
     parser = ContentParser()
     for idx, sample in enumerate(tqdm(samples)):
         if idx < START_TASK:
@@ -348,14 +439,21 @@ async def main():
         sample["raw_generation"] = await api_wrapper(prompt, TIMES)
 
         parsed_samples = list()
+        errors = 0
         for generation_item in sample["raw_generation"]:
             try:
                 parsed_samples.append(
-                    parser(prompt, generation_item, sample["entry_point"]))
+                    parser(prompt, generation_item, sample["entry_point"], LANGUAGE))
             except ParseError as e:
+                errors += 1
                 parse_errors += 1
                 print("PARSE EXCEPTION:", e)
                 parsed_samples.append("")
+
+        errors_per_sample.append({
+            "task_id": sample["task_id"],
+            "errors": errors,
+        })
 
         sample["generation"] = parsed_samples
 
@@ -373,6 +471,8 @@ async def main():
 
     if VERBOSE:
         print("parse error rate:", parse_errors / len(samples))
+        print("errors per task:", list(
+            filter(lambda e: e["errors"] > 0, errors_per_sample)))
 
     with jsonlines.open(RESULT_FILENAME, "w") as writer:
         writer.write_all(samples)

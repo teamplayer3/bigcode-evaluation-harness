@@ -165,11 +165,15 @@ class ContentParser:
 
 class ChatWrapper:
 
-    def __init__(self, model: str):
+    def __init__(self, model: str, api_key: str):
         self._model = model
+        self.client = openai.OpenAI(
+            api_key=api_key
+        )
 
     def __call__(self, prompt: str, n: int) -> str:
         messages = [
+            {"role": "system", "content": "You are a rust expert. Generate only functions for the task in idiomatic rust. No main function and no tests."},
             {
                 "role": "user",
                 "content": prompt,
@@ -177,18 +181,17 @@ class ChatWrapper:
         ]
         while True:
             try:
-                response = openai.ChatCompletion.create(
+                response = self.client.chat.completions.create(
                     model=self._model,
                     messages=messages,
-                    temperature=0.2,
+                    temperature=0.8,
                     top_p=0.95,
                     n=n
                 )
                 content_list = list()
                 for i in range(n):
-                    message = response["choices"][i]["message"]
-                    assert message["role"] == "assistant"
-                    content_list.append(message["content"])
+                    message = response.choices[i].message.content
+                    content_list.append(message)
                 return content_list
             except Exception as e:
                 print("API EXCEPTION:", e)
@@ -198,8 +201,9 @@ if __name__ == '__main__':
     TIMES = 1
     VERBOSE = True
     LANGUAGE = "rust"
-    MODEL = "gpt-4-0613"
+    MODEL = "gpt-4-1106-preview"
     TASK = "humanevalsynthesize"
+    API_KEY = "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"
 
     # Load descriptions
     if TASK == "humanevalexplainsynthesize":
@@ -212,7 +216,7 @@ if __name__ == '__main__':
     samples = [s for s in load_dataset(
         "bigcode/humanevalpack", LANGUAGE)["test"]]
 
-    chat_wrapper = ChatWrapper(MODEL)
+    chat_wrapper = ChatWrapper(MODEL, API_KEY)
     parse_errors = 0
     parser = ContentParser()
     for idx, sample in enumerate(tqdm(samples)):
@@ -235,13 +239,19 @@ if __name__ == '__main__':
             print(
                 f"Processing {sample['task_id']} ({idx + 1}/{len(samples)}))...")
         sample["raw_generation"] = chat_wrapper(prompt, TIMES)
+        parsed_samples = list()
         try:
-            sample["generation"] = [parser(prompt, generation_item, sample["entry_point"])
-                                    for generation_item in sample["raw_generation"]]
+            for generation_item in sample["raw_generation"]:
+                parsed_sample = parser(
+                    prompt, generation_item, sample["entry_point"])
+                parsed_samples.append(parsed_sample)
         except ParseError as e:
             parse_errors += 1
             print("PARSE EXCEPTION:", e)
-            sample["generation"] = [""]
+            parsed_samples.append("")
+
+        sample["generation"] = parsed_samples
+
         if VERBOSE:
             for i in range(TIMES):
                 print(termcolor.colored(
