@@ -45,7 +45,7 @@ import aiohttp
 from cdifflib import CSequenceMatcher
 from camel_converter import to_snake
 from datasets import load_dataset
-from typing import List
+from typing import Any, List
 from tqdm import tqdm
 
 _CITATION = """
@@ -66,7 +66,7 @@ LANGUAGE_TO_NAME = {
     "rust": "Rust",
 }
 
-LLM_TYPE = "CODE_LLAMA"  # "OCTOCODER", "CODE_LLAMA", "CODE_LLAMA_7B"
+LLM_TYPE = "CODEGEN_RUST"  # "OCTOCODER", "CODE_LLAMA", "CODE_LLAMA_7B"
 
 
 def get_prompt_base(doc, language):
@@ -104,6 +104,12 @@ def get_prompt_synthesize(doc, language="python"):
     if LLM_TYPE == "WIZARD_CODER":
         def prompt_template(instruction: str, context: str, function_start: str) -> str:
             return f"Below is an instruction that describes a task. Write a response that appropriately completes the request.\n\n### Instruction:\n{instruction}\n\n### Response:"
+
+    if LLM_TYPE == "CODEGEN_RUST":
+        def prompt_template(docstring: str) -> str:
+            return f"{docstring}"
+        
+        return prompt_template(docstring=doc["prompt"])
 
     return prompt_template(doc["instruction"], "", doc["prompt"])
 
@@ -167,8 +173,10 @@ class ContentParser:
             entry_point[0].lower() + entry_point[1:],
         ]
 
-    def __call__(self, prompt: str, content: str, entry_point: str, language: str = "python"):
+    def __call__(self, prompt: str, content: str, entry_point: str, func_start_in_prompt: bool = True, language: str = "python"):
         raw_content = content
+
+        content = content.replace(prompt, "", 1)
 
         # remove comments
         content = "".join(filter(lambda x: not x.startswith(
@@ -182,6 +190,24 @@ class ContentParser:
         # if tag == "insert":
         #     return content[j1:j2]
         # second parse content with assumption that model wrote code without description
+
+        if not func_start_in_prompt:
+            # split at func start
+            for entry_point in self._entry_point_variations(entry_point):
+                if entry_point in content:
+                    if language == "python":
+                        func_prefix = "def"
+                    elif language == "rust":
+                        func_prefix = "fn"
+
+                    parts = content.split(f"{func_prefix} {entry_point}")
+                    if len(parts) > 1:
+                        content = "".join(
+                            parts[1].splitlines(keepends=True)[1:])
+
+                    parts = content.split(f"{func_prefix} main")
+                    if len(parts) > 1:
+                        content = parts[0]
 
         if language == "python":
             content_lines = content.splitlines(keepends=True)[1:]
@@ -248,22 +274,6 @@ class ContentParser:
 
             content = content_out[start_idx:end_idx + 1]
 
-        # split at func start
-        for entry_point in self._entry_point_variations(entry_point):
-            if entry_point in content:
-                if language == "python":
-                    func_prefix = "def"
-                elif language == "rust":
-                    func_prefix = "fn"
-
-                parts = content.split(f"{func_prefix} {entry_point}")
-                if len(parts) > 1:
-                    content = "".join(parts[1].splitlines(keepends=True)[1:])
-
-                parts = content.split(f"{func_prefix} main")
-                if len(parts) > 1:
-                    content = parts[0]
-
         if len(content.strip()) == 0:
             raise ParseError(f"Prompt is not in content:\n{raw_content}")
 
@@ -328,6 +338,30 @@ async def call_huggingface_api(session: aiohttp.ClientSession, url: str, prompt:
 
     return response[0]["generated_text"]
 
+from peft import PeftConfig, PeftModel
+from transformers import AutoTokenizer, AutoModelForCausalLM
+
+class CodegenRustModel:
+
+    def __init__(self, temperature: float) -> None:
+        self.temperature = temperature
+        model_name = "ammarnasr/codegen-350M-mono-rust"
+        peft_config = PeftConfig.from_pretrained(model_name)
+
+        self.tokenizer = AutoTokenizer.from_pretrained(peft_config.base_model_name_or_path)
+
+        model = AutoModelForCausalLM.from_pretrained(peft_config.base_model_name_or_path, device_map="cuda:0")
+        self.model = PeftModel.from_pretrained(model, model_name)
+
+    async def __call__(self, prompt: str, n: int) -> [str]:
+
+        prompts = [prompt for i in range(n)]
+
+        input_ids = self.tokenizer(prompts, return_tensors="pt").to("cuda")
+        generated_ids = self.model.generate(**input_ids, max_length=512, temperature = self.temperature, do_sample = True, top_p = 0.95)
+        resp = self.tokenizer.batch_decode(generated_ids, skip_special_tokens=True)
+        
+        return resp
 
 class ApiWrapper:
 
@@ -408,7 +442,11 @@ async def main():
         samples = [s for s in load_dataset(
             "bigcode/humanevalpack", LANGUAGE)["test"]]
 
-    api_wrapper = ApiWrapper(ENDPOINT_URL, TEMPERATURE)
+    if LLM_TYPE == "CODEGEN_RUST":
+        api_wrapper = CodegenRustModel(TEMPERATURE)
+    else:
+        api_wrapper = ApiWrapper(ENDPOINT_URL, TEMPERATURE)
+
     parse_errors = 0
 
     errors_per_sample = []
@@ -436,6 +474,7 @@ async def main():
         if VERBOSE:
             print(
                 f"Processing {sample['task_id']} ({idx + 1}/{len(samples)}))...")
+        
         sample["raw_generation"] = await api_wrapper(prompt, TIMES)
 
         parsed_samples = list()
@@ -443,7 +482,7 @@ async def main():
         for generation_item in sample["raw_generation"]:
             try:
                 parsed_samples.append(
-                    parser(prompt, generation_item, sample["entry_point"], LANGUAGE))
+                    parser(prompt, generation_item, sample["entry_point"], False, LANGUAGE))
             except ParseError as e:
                 errors += 1
                 parse_errors += 1
