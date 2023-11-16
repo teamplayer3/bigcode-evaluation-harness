@@ -3,6 +3,7 @@ from camel_converter import to_snake
 from typing import List
 
 import jsonlines
+from bigcode_eval.tasks.resp_parser import RespParser
 
 
 def prompt_template(instruction: str, context: str, function_start: str) -> str:
@@ -40,16 +41,18 @@ class ContentParser:
         #     return content[j1:j2]
         # second parse content with assumption that model wrote code without description
 
-        if not func_start_in_prompt:
+        if func_start_in_prompt:
             # split at func start
             for entry_point in self._entry_point_variations(entry_point):
-                if entry_point in content:
-                    if language == "python":
-                        func_prefix = "def"
-                    elif language == "rust":
-                        func_prefix = "fn"
+                if language == "python":
+                    func_prefix = "def"
+                elif language == "rust":
+                    func_prefix = "fn"
 
-                    parts = content.split(f"{func_prefix} {entry_point}")
+                entry_point = f"{func_prefix} {entry_point}"
+                if entry_point in content:
+
+                    parts = content.split(entry_point)
                     if len(parts) > 1:
                         content = "".join(
                             parts[1].splitlines(keepends=True)[1:])
@@ -153,72 +156,24 @@ class ContentParser:
 # */
 # fn below_zero(operations:Vec<i32>) -> bool{\
 # """
-raw_out = """let mut min_val= max(interval1[0], interval2[0]); //min value between interval1 & interval2
-        let mut max_val= min(interval1[1], interval2[1]);//max value between interval1 & interval2
-
-        if min_val > max_val{
-                return "NO";
-        }else if min_val == max_val && ((interval1[0]!= interval2[0]) || (interval1[1]!= interval2[1])){
-                return "NO";
-        }else{
-
-                let mut count=0;
-
-                while min_val <= max_val{
-                        count+=1;
-                        min_val += 1;
-                }
-
-                for i in range(2..count){
-
-                        if count % i==0{
-                                return "NO"
-                        }
-                }
-                return "YES";
-        }
-}
-
-
-
-Answer: use std::{slice::Iter, cmp::{max, self}, mem::replace, collections::{HashSet, HashMap}, ops::Index, ascii::AsciiExt};
-use rand::Rng;
-use regex::Regex;
-use md5;
-use std::any::{Any, TypeId};
-
-/*
-You are given two intervals,
-    where each interval is a pair of integers. For example, interval = (start, end) = (1, 2).
-    The given intervals are closed which means that the interval (start, end)
-    includes both start and end.
-    For each given interval, it is assumed that its start is less or equal its end.
-    Your task is to determine whether the length of intersection of these two 
-    intervals is a prime number.
-    Example, the intersection of the intervals (1, 3), (2, 4) is (2, 3)
-    which its length is 1, which not a prime number.
-    If the length of the intersection is a prime number, return "YES",
-    otherwise, return "NO".
-    If the two intervals don't intersect, return "NO".
-    
-*/
-fn intersection(interval1: Vec<i32>, interval2: Vec<i32>) -> String {
-
-    let mut min_val= max(interval1[0], interval2[0]); //min value between interval1 & interval2
-    let mut max_val= min(interval1
+raw_out = """```rust\nuse std::iter::Sum;\n\nfn sumup_values<T: Sum + Clone>(values: &[T]) -> T {\n    values.iter().cloned().sum()\n}\n\n// Example usage:\n// let nums = vec![1, 2, 3, 4, 5];\n// let result = sumup_values(&nums);\n// println!(\"The sum is: {}\", result);\n```
 """
 
-# print(ContentParser()("", raw_out, "intersection", "rust"))
+# print(RespParser(pretend_entry_func_included=False)(raw_out, "sumup_values", ""))
 
 # exit()
 
 PATH = "/home/al9hu7/workspace/ma/generated-data/humaneval-rust-samples/"
+# PATH = "/home/al9hu7/workspace/ma/generated-data/ownbenchmark-samples/"
 # PATH = "./"
-# FILE_NAME = "completions_rust_humanevalsynthesize_codellama_instruct_34b_t0.2_tp0.95"
-FILE_NAME = "completions_rust_humanevalsynthesize_gpt_4turbo_t0.8_tp0.95"
+FILE_NAME = "completions_rust_humanevalsynthesize_codellama_instruct_7b_t0.2_tp0.95"
+# FILE_NAME = "completions_rust_humanevalsynthesize_gpt_4turbo_t0.8_tp0.95"
 # FILE_NAME = "completions_rust_humanevalsynthesize"
+# FILE_NAME = "completions_rust_ownbenchmark_gpt_4turbo_t0.8_tp0.95"
 
-content_parser = ContentParser()
+FUNC_START_IN_PROMPT = True
+
+content_parser = RespParser(language="rust")
 
 errors_per_sample = []
 
@@ -237,8 +192,8 @@ with jsonlines.open(f"{PATH}{FILE_NAME}.jsonl") as reader:
             for raw_generation in raw_generations:
                 samples += 1
                 try:
-                    parsed_gen = content_parser(prompt=prompt_template(
-                        line["instruction"], "", ""), content=raw_generation, entry_point=line["entry_point"], func_start_in_prompt=False, language="rust")
+                    parsed_gen = content_parser(
+                        response=raw_generation, entry_point=line["entry_point"], helper_decl="")
                     parsed.append(parsed_gen)
                 except ParseError as e:
                     parse_errors += 1

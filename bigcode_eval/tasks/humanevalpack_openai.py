@@ -35,6 +35,7 @@ messages=messages
 )
 """
 
+import constants
 import os
 import openai
 import jsonlines
@@ -173,7 +174,7 @@ class ChatWrapper:
 
     def __call__(self, prompt: str, n: int) -> str:
         messages = [
-            {"role": "system", "content": "You are a rust expert. Generate only functions for the task in idiomatic rust. No main function and no tests."},
+            {"role": "system", "content": "You are a rust expert. Answer only with the requested function and maybe helpers after the target function in one code block."},
             {
                 "role": "user",
                 "content": prompt,
@@ -203,7 +204,10 @@ if __name__ == '__main__':
     LANGUAGE = "rust"
     MODEL = "gpt-4-1106-preview"
     TASK = "humanevalsynthesize"
-    API_KEY = "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"
+    API_KEY = constants.OPENAI_KEY
+    SAMPLE_TYPE = "own"  # "humaneval"
+
+    RESULTS_FILENAME = f"completions_{LANGUAGE}_{TASK}.jsonl"
 
     # Load descriptions
     if TASK == "humanevalexplainsynthesize":
@@ -213,8 +217,26 @@ if __name__ == '__main__':
     openai.organization = os.getenv("OPENAI_ORGANIZATION")
     openai.api_key = os.getenv("OPENAI_API_KEY")
 
-    samples = [s for s in load_dataset(
-        "bigcode/humanevalpack", LANGUAGE)["test"]]
+    if SAMPLE_TYPE == "humaneval":
+        samples = [s for s in load_dataset(
+            "bigcode/humanevalpack", LANGUAGE)["test"]]
+    elif SAMPLE_TYPE == "own":
+        PATH = "/home/al9hu7/workspace/ma/generated-data/own-rust-benchmark/rust-benchmark.json"
+        with open(PATH, "r") as f:
+            import json
+            samples = json.load(f)
+
+        def sample_mapper(sample):
+            sample["task_id"] = f"Rust/{sample['task_id']}"
+            sample["declaration"] = sample["declaration"]
+            sample["test"] = sample["test"]
+            sample["entry_point"] = sample["entry_point"]
+            sample["canonical_solution"] = sample["canonical_solution"]
+            sample["instruction"] = sample["instruction"] + \
+                "\n" + sample["prompt"] + "\n" + sample["helper"]
+            return sample
+
+        samples = list(map(sample_mapper, samples))
 
     chat_wrapper = ChatWrapper(MODEL, API_KEY)
     parse_errors = 0
@@ -260,9 +282,12 @@ if __name__ == '__main__':
                 print(termcolor.colored(sample["canonical_solution"], "red"))
                 print(termcolor.colored(
                     sample["generation"][i], "green")+"\n\n")
+
+        with jsonlines.open(RESULTS_FILENAME, "w") as writer:
+            writer.write_all(samples)
+
     if VERBOSE:
         print("parse error rate:", parse_errors / len(samples))
 
-    results_filename = f"completions_{LANGUAGE}_{TASK}.jsonl"
-    with jsonlines.open(results_filename, "w") as writer:
+    with jsonlines.open(RESULTS_FILENAME, "w") as writer:
         writer.write_all(samples)

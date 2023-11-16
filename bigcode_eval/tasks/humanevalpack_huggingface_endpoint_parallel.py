@@ -35,6 +35,8 @@ messages=messages
 )
 """
 
+from transformers import AutoTokenizer, AutoModelForCausalLM
+from peft import PeftConfig, PeftModel
 import os
 import openai
 import jsonlines
@@ -66,7 +68,8 @@ LANGUAGE_TO_NAME = {
     "rust": "Rust",
 }
 
-LLM_TYPE = "CODEGEN_RUST"  # "OCTOCODER", "CODE_LLAMA", "CODE_LLAMA_7B"
+# "OCTOCODER", "CODE_LLAMA", "CODE_LLAMA_7B", "CODEGEN_RUST", "GPT"
+LLM_TYPE = "CODE_LLAMA"
 
 
 def get_prompt_base(doc, language):
@@ -108,8 +111,12 @@ def get_prompt_synthesize(doc, language="python"):
     if LLM_TYPE == "CODEGEN_RUST":
         def prompt_template(docstring: str) -> str:
             return f"{docstring}"
-        
+
         return prompt_template(docstring=doc["prompt"])
+
+    if LLM_TYPE == "GPT":
+        def prompt_template(instruction: str, context: str, function_start: str) -> str:
+            return f"{instruction}"
 
     return prompt_template(doc["instruction"], "", doc["prompt"])
 
@@ -338,8 +345,6 @@ async def call_huggingface_api(session: aiohttp.ClientSession, url: str, prompt:
 
     return response[0]["generated_text"]
 
-from peft import PeftConfig, PeftModel
-from transformers import AutoTokenizer, AutoModelForCausalLM
 
 class CodegenRustModel:
 
@@ -348,9 +353,11 @@ class CodegenRustModel:
         model_name = "ammarnasr/codegen-350M-mono-rust"
         peft_config = PeftConfig.from_pretrained(model_name)
 
-        self.tokenizer = AutoTokenizer.from_pretrained(peft_config.base_model_name_or_path)
+        self.tokenizer = AutoTokenizer.from_pretrained(
+            peft_config.base_model_name_or_path)
 
-        model = AutoModelForCausalLM.from_pretrained(peft_config.base_model_name_or_path, device_map="cuda:0")
+        model = AutoModelForCausalLM.from_pretrained(
+            peft_config.base_model_name_or_path, device_map="cuda:0")
         self.model = PeftModel.from_pretrained(model, model_name)
 
     async def __call__(self, prompt: str, n: int) -> [str]:
@@ -358,33 +365,65 @@ class CodegenRustModel:
         prompts = [prompt for i in range(n)]
 
         input_ids = self.tokenizer(prompts, return_tensors="pt").to("cuda")
-        generated_ids = self.model.generate(**input_ids, max_length=512, temperature = self.temperature, do_sample = True, top_p = 0.95)
-        resp = self.tokenizer.batch_decode(generated_ids, skip_special_tokens=True)
-        
+        generated_ids = self.model.generate(
+            **input_ids, max_length=512, temperature=self.temperature, do_sample=True, top_p=0.95)
+        resp = self.tokenizer.batch_decode(
+            generated_ids, skip_special_tokens=True)
+
         return resp
+
 
 class ApiWrapper:
 
-    def __init__(self, endpoint_url: str, temperature: float):
+    def __init__(self, endpoint_url: str, temperature: float, openai_api_key: str = None) -> None:
         self.endpoint_url = endpoint_url
         self.temperature = temperature
+        if LLM_TYPE == "GPT":
+            self.client = openai.OpenAI(
+                api_key=openai_api_key
+            )
 
     async def __call__(self, prompt: str, n: int) -> [str]:
         global LLM_TYPE
 
-        while True:
-            try:
-                async with aiohttp.ClientSession() as session:
-                    if LLM_TYPE == "WIZARD_CODER" or LLM_TYPE == "OCTOCODER" or LLM_TYPE == "CODE_LLAMA_7B":
-                        content_list = await asyncio.gather(*[call_huggingface_api(
-                            session, self.endpoint_url, prompt, self.temperature) for _ in range(n)])
-                    if LLM_TYPE == "CODE_LLAMA":
-                        content_list = await asyncio.gather(*[call_anyscale_api(
-                            session, prompt, self.temperature) for _ in range(n)])
-
+        if LLM_TYPE == "GPT":
+            messages = [
+                {"role": "system", "content": "You are a rust expert. Answer only with the requested function and maybe helpers after the target function in one code block."},
+                {
+                    "role": "user",
+                    "content": prompt,
+                }
+            ]
+            while True:
+                try:
+                    response = self.client.chat.completions.create(
+                        model="gpt-4-1106-preview",
+                        messages=messages,
+                        temperature=0.8,
+                        top_p=0.95,
+                        n=n
+                    )
+                    content_list = list()
+                    for i in range(n):
+                        message = response.choices[i].message.content
+                        content_list.append(message)
                     return content_list
-            except Exception as e:
-                print("API EXCEPTION:", e)
+                except Exception as e:
+                    print("API EXCEPTION:", e)
+        else:
+            while True:
+                try:
+                    async with aiohttp.ClientSession() as session:
+                        if LLM_TYPE == "WIZARD_CODER" or LLM_TYPE == "OCTOCODER" or LLM_TYPE == "CODE_LLAMA_7B":
+                            content_list = await asyncio.gather(*[call_huggingface_api(
+                                session, self.endpoint_url, prompt, self.temperature) for _ in range(n)])
+                        if LLM_TYPE == "CODE_LLAMA":
+                            content_list = await asyncio.gather(*[call_anyscale_api(
+                                session, prompt, self.temperature) for _ in range(n)])
+
+                        return content_list
+                except Exception as e:
+                    print("API EXCEPTION:", e)
 
 
 async def main():
@@ -392,11 +431,20 @@ async def main():
 
     START_TASK = 0
 
-    TIMES = 20
+    TIMES = 1
     VERBOSE = True
     LANGUAGE = "rust"
     TEMPERATURE = 0.2
     ENDPOINT_URL = None
+    SAMPLE_TYPE = "own"
+    TASK = "humanevalsynthesize"
+
+    RESULT_FILENAME = f"completions_{LANGUAGE}_{TASK}.jsonl"
+    # RESULT_FILENAME = "/home/al9hu7/workspace/ma/generated-data/humaneval-rust-samples/completions_rust_humanevalsynthesize_codellama_instruct_34b_t0.2_tp0.95.jsonl"
+    # RESULT_FILENAME = "/home/al9hu7/workspace/ma/generated-data/ownbenchmark-samples/completions_rust_ownbenchmark_gpt_4turbo_t0.8_tp0.95.jsonl"
+
+    import constants
+    API_KEY = constants.OPENAI_KEY
     # wizardcoder
     if LLM_TYPE == "WIZARD_CODER":
         ENDPOINT_URL = "https://xy32vdwpo5jeptys.us-east-1.aws.endpoints.huggingface.cloud"
@@ -407,9 +455,6 @@ async def main():
     if LLM_TYPE == "CODE_LLAMA_7B":
         # ENDPOINT_URL = "https://b9al2eru8mdlz5uo.us-east-1.aws.endpoints.huggingface.cloud"
         ENDPOINT_URL = ""
-    TASK = "humanevalsynthesize"
-    RESULT_FILENAME = f"completions_{LANGUAGE}_{TASK}.jsonl"
-    # RESULT_FILENAME = "/home/al9hu7/workspace/ma/generated-data/humaneval-rust-samples/completions_rust_humanevalsynthesize_codellama_instruct_34b_t0.2_tp0.95.jsonl"
 
     # Load descriptions
     if TASK == "humanevalexplainsynthesize":
@@ -419,70 +464,87 @@ async def main():
     openai.organization = os.getenv("OPENAI_ORGANIZATION")
     openai.api_key = os.getenv("OPENAI_API_KEY")
 
+    def tasks_mapper(task):
+        task["task_id"] = f"Rust/{task['task_id']}" if isinstance(
+            task["task_id"], int) else task["task_id"]
+        task["declaration"] = task["declaration"]
+        task["test"] = task["test"]
+        task["entry_point"] = task["entry_point"]
+        task["canonical_solution"] = task["canonical_solution"]
+        task["instruction"] = task["instruction"] + \
+            "\n" + task["prompt"] + "\n" + task["helper"]
+        return task
+
+    if SAMPLE_TYPE == "humaneval":
+        tasks = [s for s in load_dataset(
+            "bigcode/humanevalpack", LANGUAGE)["test"]]
+    elif SAMPLE_TYPE == "own":
+        PATH = "/home/al9hu7/workspace/ma/generated-data/own-rust-benchmark/rust-benchmark.json"
+        with open(PATH, "r") as f:
+            import json
+            tasks = json.load(f)
+
+    # start at a specific task from already sampled file
     if START_TASK > 0:
         with jsonlines.open(RESULT_FILENAME, "r") as reader:
             samples = [s for s in reader]
 
-        bench = [s for s in load_dataset(
-            "bigcode/humanevalpack", LANGUAGE)["test"]]
-
+        # add missing tasks from benchmark
         out_samples = []
-
-        bench_iter = bench.__iter__()
-
+        tasks_iter = tasks.__iter__()
         for line in samples:
             out_samples.append(line)
-            bench_iter.__next__()
-
-        for line in bench_iter:
+            tasks_iter.__next__()
+        for line in tasks_iter:
             out_samples.append(line)
 
-        samples = out_samples
-    else:
-        samples = [s for s in load_dataset(
-            "bigcode/humanevalpack", LANGUAGE)["test"]]
+        tasks = out_samples
+
+    # map from own benchmark to humaneval format
+    if SAMPLE_TYPE == "own":
+        tasks = list(map(tasks_mapper, tasks))
 
     if LLM_TYPE == "CODEGEN_RUST":
         api_wrapper = CodegenRustModel(TEMPERATURE)
     else:
-        api_wrapper = ApiWrapper(ENDPOINT_URL, TEMPERATURE)
+        api_wrapper = ApiWrapper(ENDPOINT_URL, TEMPERATURE, API_KEY)
 
     parse_errors = 0
 
     errors_per_sample = []
 
     parser = ContentParser()
-    for idx, sample in enumerate(tqdm(samples)):
+    for idx, task in enumerate(tqdm(tasks)):
         if idx < START_TASK:
             continue
 
         if TASK == "humanevalfix":
-            prompt = get_prompt_fix(sample, language=LANGUAGE, mode="tests")
+            prompt = get_prompt_fix(task, language=LANGUAGE, mode="tests")
         elif TASK == "humanevalsynthesize":
-            prompt = get_prompt_synthesize(sample, language=LANGUAGE)
+            prompt = get_prompt_synthesize(task, language=LANGUAGE)
         elif TASK == "humanevalexplaindescribe":
             prompt, docstring_len = get_prompt_explain_desc(
-                sample, language=LANGUAGE)
+                task, language=LANGUAGE)
             gen = await api_wrapper(prompt, TIMES)
-            sample["raw_generation"] = gen
-            sample["generation"] = [gen_item[:docstring_len]
-                                    for gen_item in gen]
+            task["raw_generation"] = gen
+            task["generation"] = [gen_item[:docstring_len]
+                                  for gen_item in gen]
             continue
         elif TASK == "humanevalexplainsynthesize":
             desc = descriptions[idx]
-            prompt = get_prompt_explain_syn(sample, desc, language=LANGUAGE)
+            prompt = get_prompt_explain_syn(task, desc, language=LANGUAGE)
         if VERBOSE:
             print(
-                f"Processing {sample['task_id']} ({idx + 1}/{len(samples)}))...")
-        
-        sample["raw_generation"] = await api_wrapper(prompt, TIMES)
+                f"Processing {task['task_id']} ({idx + 1}/{len(tasks)}))...")
+
+        task["raw_generation"] = await api_wrapper(prompt, TIMES)
 
         parsed_samples = list()
         errors = 0
-        for generation_item in sample["raw_generation"]:
+        for generation_item in task["raw_generation"]:
             try:
                 parsed_samples.append(
-                    parser(prompt, generation_item, sample["entry_point"], False, LANGUAGE))
+                    parser(prompt, generation_item, task["entry_point"], False, LANGUAGE))
             except ParseError as e:
                 errors += 1
                 parse_errors += 1
@@ -490,31 +552,31 @@ async def main():
                 parsed_samples.append("")
 
         errors_per_sample.append({
-            "task_id": sample["task_id"],
+            "task_id": task["task_id"],
             "errors": errors,
         })
 
-        sample["generation"] = parsed_samples
+        task["generation"] = parsed_samples
 
         if VERBOSE:
             for i in range(TIMES):
                 print(termcolor.colored(
-                    sample["entry_point"], "yellow", attrs=["bold"]))
+                    task["entry_point"], "yellow", attrs=["bold"]))
                 print(termcolor.colored(prompt, "yellow"))
-                print(termcolor.colored(sample["canonical_solution"], "red"))
+                print(termcolor.colored(task["canonical_solution"], "red"))
                 print(termcolor.colored(
-                    sample["generation"][i], "green")+"\n\n")
+                    task["generation"][i], "green")+"\n\n")
 
         with jsonlines.open(RESULT_FILENAME, "w") as writer:
-            writer.write_all(samples)
+            writer.write_all(tasks)
 
     if VERBOSE:
-        print("parse error rate:", parse_errors / len(samples))
+        print("parse error rate:", parse_errors / len(tasks))
         print("errors per task:", list(
             filter(lambda e: e["errors"] > 0, errors_per_sample)))
 
     with jsonlines.open(RESULT_FILENAME, "w") as writer:
-        writer.write_all(samples)
+        writer.write_all(tasks)
 
 if __name__ == '__main__':
     asyncio.run(main())
