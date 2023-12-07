@@ -11,3 +11,4 @@ openai
 jsonlines
 cdifflib
 camel_converter
+replicate

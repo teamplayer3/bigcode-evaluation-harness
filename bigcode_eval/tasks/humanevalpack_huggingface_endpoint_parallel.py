@@ -35,6 +35,7 @@ messages=messages
 )
 """
 
+from importlib.metadata import entry_points
 from transformers import AutoTokenizer, AutoModelForCausalLM
 from peft import PeftConfig, PeftModel
 import os
@@ -49,6 +50,10 @@ from camel_converter import to_snake
 from datasets import load_dataset
 from typing import Any, List
 from tqdm import tqdm
+
+from resp_parser import RespParser, ParseError, find_function_names
+import constants
+import replicate
 
 _CITATION = """
 @article{muennighoff2023octopack,
@@ -68,7 +73,7 @@ LANGUAGE_TO_NAME = {
     "rust": "Rust",
 }
 
-# "OCTOCODER", "CODE_LLAMA", "CODE_LLAMA_7B", "CODEGEN_RUST", "GPT"
+# "OCTOCODER", "CODE_LLAMA", "CODE_LLAMA_7B", "CODEGEN_RUST", "GPT", "WIZARD_CODER"
 LLM_TYPE = "CODE_LLAMA"
 
 
@@ -92,33 +97,75 @@ def get_prompt_synthesize(doc, language="python"):
     # Problem: Difficult for problems that have helper functions
 
     # Code LLAMA
-    if LLM_TYPE == "CODE_LLAMA" or LLM_TYPE == "CODE_LLAMA_7B":
-        def prompt_template(instruction: str, context: str, function_start: str) -> str:
-            # sys_instruct = "Below is a task description. Write code in idiomatic Rust, by using iterators, match operator, pattern matching, build in std functions, returning values without using `return`, use sage integer operators like `checked_add`, use `?` for error handling, use Option or Result for failed operations, naming convention, that completes the task."
-            # return f"<s>[INST] <<SYS>>\n{sys_instruct}\n<</SYS>>\n\n{instruction}\n{function_start}[/INST]"
-            return f"<s>[INST] {instruction}[/INST]"
+    # if LLM_TYPE == "CODE_LLAMA" or LLM_TYPE == "CODE_LLAMA_7B":
+    #     def prompt_template(instruction: str, context: str, function_start: str) -> str:
+    #         # sys_instruct = "Below is a task description. Write code in idiomatic Rust, by using iterators, match operator, pattern matching, build in std functions, returning values without using `return`, use sage integer operators like `checked_add`, use `?` for error handling, use Option or Result for failed operations, naming convention, that completes the task."
+    #         # return f"<s>[INST] <<SYS>>\n{sys_instruct}\n<</SYS>>\n\n{instruction}\n{function_start}[/INST]"
+    #         return f"<s>[INST] {instruction}[/INST]"
 
-    # For octocoder
-    if LLM_TYPE == "OCTOCODER":
-        def prompt_template(instruction: str, context: str, function_start: str) -> str:
-            return f"Question: {instruction}\n{context}\n\nAnswer:\n{function_start}"
+    # # For octocoder
+    # if LLM_TYPE == "OCTOCODER":
+    #     def prompt_template(instruction: str, context: str, function_start: str) -> str:
+    #         return f"Question: {instruction}\n{context}\n\nAnswer:\n{function_start}"
 
-    # For wizardcoder
-    if LLM_TYPE == "WIZARD_CODER":
-        def prompt_template(instruction: str, context: str, function_start: str) -> str:
-            return f"Below is an instruction that describes a task. Write a response that appropriately completes the request.\n\n### Instruction:\n{instruction}\n\n### Response:"
+    # # For wizardcoder
+    # if LLM_TYPE == "WIZARD_CODER":
+    #     def prompt_template(instruction: str, context: str, function_start: str) -> str:
+    #         return f"Below is an instruction that describes a task. Write a response that appropriately completes the request.\n\n### Instruction:\n{instruction}\n\n### Response:"
 
-    if LLM_TYPE == "CODEGEN_RUST":
-        def prompt_template(docstring: str) -> str:
-            return f"{docstring}"
+    # if LLM_TYPE == "CODEGEN_RUST":
+    #     def prompt_template(docstring: str) -> str:
+    #         return f"{docstring}"
 
-        return prompt_template(docstring=doc["prompt"])
+    #     return prompt_template(docstring=doc["prompt"])
 
-    if LLM_TYPE == "GPT":
-        def prompt_template(instruction: str, context: str, function_start: str) -> str:
-            return f"{instruction}"
+    # if LLM_TYPE == "GPT":
+    #     def prompt_template(instruction: str, context: str, function_start: str) -> str:
+    #         return f"{instruction}"
 
-    return prompt_template(doc["instruction"], "", doc["prompt"])
+    def get_prompt(prompt_type, prompt_base, instruction, context=None):
+
+        if context is None:
+            inp = instruction
+        # `Context first then instruction` methods
+        elif prompt_type in ["continue", "instruct"]:
+            inp = context + "\n" + instruction
+        else:
+            inp = instruction + "\n" + context
+
+        if prompt_type == "continue":
+            assert context is None, "The `continue` prompt should only be used for HumanEvalSynthesize. Use `instruct` for HumanEvalFix and HumanEvalExplain."
+            prompt = prompt_base
+        elif prompt_type == "instruct":
+            prompt = inp + "\n\n" + prompt_base
+        elif prompt_type in ["CODE_LLAMA", "CODE_LLAMA_7B"]:
+            system = "Provide answers in Rust. Your code should start with ```rust and end with ```."
+            # user = f"You are an expert Rust programmer, and here is your task: {inp}\nYour code should start with ```rust and end with ```."
+            # user = prompt_base
+            # prompt = f"<s>[INST] <<SYS>>\\n{system}\\n<</SYS>>\\n\\n{user}[/INST]"
+            inp = prompt_base
+            prompt = f"You are an expert Rust programmer. Write a idiomatic Rust function to complete the following prompt. Your code should start with ```rust and end with ```.\n{inp}"
+        elif prompt_type == "OCTOCODER":
+            prompt = f'Question: {inp}\n\nAnswer:\n{prompt_base}'
+        elif prompt_type == "octogeex":
+            prompt = f'Question: {inp.strip()}\n\nAnswer:\n{prompt_base}'
+        elif prompt_type == "starchat":
+            # https://huggingface.co/HuggingFaceH4/starchat-beta
+            prompt = f'<|system|>\n<|end|>\n<|user|>\n{inp}<|end|>\n<|assistant|>\n{prompt_base}'
+        elif prompt_type == "starcodercommit":
+            prompt = f'<commit_before><commit_msg>{inp}<commit_after>{prompt_base}'
+        elif prompt_type == "instructcodet5p":
+            # https://github.com/salesforce/CodeT5/blob/main/CodeT5%2B/humaneval/generate_codet5p.py#L89
+            prompt = f'Below is an instruction that describes a task. Write a response that appropriately completes the request.\n\n### Instruction:\n{inp}\n\n### Response:{prompt_base}'
+        elif prompt_type == "WIZARD_CODER":
+            # https://github.com/nlpxucan/WizardLM/blob/main/WizardCoder/src/humaneval_gen.py#L37
+            prompt = f'Below is an instruction that describes a task. Write a response that appropriately completes the request.\n\n### Instruction:\n{inp}\n\n### Response:\n{prompt_base}'
+        else:
+            raise NotImplementedError
+
+        return prompt
+
+    return get_prompt(LLM_TYPE, doc["prompt"], doc["instruction"] if "instruction" in doc else "", "").strip()
 
 
 def get_base_prompt_fix(doc, language="python", mode="tests"):
@@ -165,143 +212,164 @@ def get_prompt_explain_syn(sample, desc, language="python"):
     return desc + "\n" + instruction + "\n" + addon
 
 
-class ParseError(Exception):
-    pass
+# class ParseError(Exception):
+#     pass
 
 
-class ContentParser:
+# class ContentParser:
 
-    @staticmethod
-    def _entry_point_variations(entry_point: str) -> List[str]:
-        # NOTE: workaround dataset's bug with entry point naming
-        return [
-            entry_point,
-            to_snake(entry_point),
-            entry_point[0].lower() + entry_point[1:],
-        ]
+#     @staticmethod
+#     def _entry_point_variations(entry_point: str) -> List[str]:
+#         # NOTE: workaround dataset's bug with entry point naming
+#         return [
+#             entry_point,
+#             to_snake(entry_point),
+#             entry_point[0].lower() + entry_point[1:],
+#         ]
 
-    def __call__(self, prompt: str, content: str, entry_point: str, func_start_in_prompt: bool = True, language: str = "python"):
-        raw_content = content
+#     def __call__(self, prompt: str, content: str, entry_point: str, func_start_in_prompt: bool = True, language: str = "python"):
+#         raw_content = content
 
-        content = content.replace(prompt, "", 1)
+#         content = content.replace(prompt, "", 1)
 
-        # remove comments
-        content = "".join(filter(lambda x: not x.startswith(
-            "//"), content.splitlines(keepends=True)))
+#         # remove comments
+#         content = "".join(filter(lambda x: not x.startswith(
+#             "//"), content.splitlines(keepends=True)))
 
-        if "```" in content:
-            content = content.split("```")[1]
-        # first parse with assumption that content has description
-        # matcher = CSequenceMatcher(None, prompt, content)
-        # tag, _, _, j1, j2 = matcher.get_opcodes()[-1]
-        # if tag == "insert":
-        #     return content[j1:j2]
-        # second parse content with assumption that model wrote code without description
+#         if "```" in content:
+#             content = content.split("```")[1]
+#         # first parse with assumption that content has description
+#         # matcher = CSequenceMatcher(None, prompt, content)
+#         # tag, _, _, j1, j2 = matcher.get_opcodes()[-1]
+#         # if tag == "insert":
+#         #     return content[j1:j2]
+#         # second parse content with assumption that model wrote code without description
 
-        if not func_start_in_prompt:
-            # split at func start
-            for entry_point in self._entry_point_variations(entry_point):
-                if entry_point in content:
-                    if language == "python":
-                        func_prefix = "def"
-                    elif language == "rust":
-                        func_prefix = "fn"
+#         if not func_start_in_prompt:
+#             # split at func start
+#             for entry_point in self._entry_point_variations(entry_point):
+#                 if entry_point in content:
+#                     if language == "python":
+#                         func_prefix = "def"
+#                     elif language == "rust":
+#                         func_prefix = "fn"
 
-                    parts = content.split(f"{func_prefix} {entry_point}")
-                    if len(parts) > 1:
-                        content = "".join(
-                            parts[1].splitlines(keepends=True)[1:])
+#                     parts = content.split(f"{func_prefix} {entry_point}")
+#                     if len(parts) > 1:
+#                         content = "".join(
+#                             parts[1].splitlines(keepends=True)[1:])
 
-                    parts = content.split(f"{func_prefix} main")
-                    if len(parts) > 1:
-                        content = parts[0]
+#                     parts = content.split(f"{func_prefix} main")
+#                     if len(parts) > 1:
+#                         content = parts[0]
 
-        if language == "python":
-            content_lines = content.splitlines(keepends=True)[1:]
-            func_lines = []
-            for line in content_lines:
-                if line.startswith("    ") or line.startswith("\n"):
-                    func_lines.append(line)
-                else:
-                    break
-            content = "".join(func_lines)
-        elif language == "rust":
-            start_idx = 0
-            end_idx = 0
-            open_brackets = 1
-            in_string = False
-            in_char_string = False
-            char_str_len = 0
-            content_out = ""
-            in_func = True
-            cycle_buf = ""
-            wait_for_func_start = False
+#         if language == "python":
+#             content_lines = content.splitlines(keepends=True)[1:]
+#             func_lines = []
+#             for line in content_lines:
+#                 if line.startswith("    ") or line.startswith("\n"):
+#                     func_lines.append(line)
+#                 else:
+#                     break
+#             content = "".join(func_lines)
+#         elif language == "rust":
+#             start_idx = 0
+#             end_idx = 0
+#             open_brackets = 1
+#             in_string = False
+#             in_char_string = False
+#             char_str_len = 0
+#             content_out = ""
+#             in_func = True
+#             cycle_buf = ""
+#             wait_for_func_start = False
 
-            for idx, char in enumerate(content):
-                if in_func:
-                    last_was_escape = len(
-                        cycle_buf) == 0 or not cycle_buf[-1] == "\\"
+#             for idx, char in enumerate(content):
+#                 if in_func:
+#                     last_was_escape = len(
+#                         cycle_buf) == 0 or not cycle_buf[-1] == "\\"
 
-                    if not in_char_string and not last_was_escape and char == '"':
-                        in_string = not in_string
+#                     if not in_char_string and not last_was_escape and char == '"':
+#                         in_string = not in_string
 
-                    if not in_string and not not last_was_escape and char == "'":
-                        char_str_len = 0
-                        in_char_string = not in_char_string
+#                     if not in_string and not not last_was_escape and char == "'":
+#                         char_str_len = 0
+#                         in_char_string = not in_char_string
 
-                    if in_char_string:
-                        char_str_len += 1
-                        if char_str_len == 3:
-                            in_char_string = False
-                            char_str_len = 0
+#                     if in_char_string:
+#                         char_str_len += 1
+#                         if char_str_len == 3:
+#                             in_char_string = False
+#                             char_str_len = 0
 
-                    if not in_string and not in_char_string:
-                        if char == '{':
-                            open_brackets += 1
-                        elif char == '}':
-                            open_brackets -= 1
+#                     if not in_string and not in_char_string:
+#                         if char == '{':
+#                             open_brackets += 1
+#                         elif char == '}':
+#                             open_brackets -= 1
 
-                    if open_brackets == 0:
-                        end_idx = idx
-                        in_func = False
-                else:
-                    if cycle_buf[-2:] + char == "\nfn":
-                        wait_for_func_start = True
+#                     if open_brackets == 0:
+#                         end_idx = idx
+#                         in_func = False
+#                 else:
+#                     if cycle_buf[-2:] + char == "\nfn":
+#                         wait_for_func_start = True
 
-                    if wait_for_func_start and char == "{":
-                        open_brackets += 1
-                        wait_for_func_start = False
-                        in_func = True
+#                     if wait_for_func_start and char == "{":
+#                         open_brackets += 1
+#                         wait_for_func_start = False
+#                         in_func = True
 
-                content_out += char
+#                 content_out += char
 
-                if len(cycle_buf) > 3:
-                    cycle_buf = cycle_buf[1:]
-                cycle_buf += char
+#                 if len(cycle_buf) > 3:
+#                     cycle_buf = cycle_buf[1:]
+#                 cycle_buf += char
 
-            content = content_out[start_idx:end_idx + 1]
+#             content = content_out[start_idx:end_idx + 1]
 
-        if len(content.strip()) == 0:
-            raise ParseError(f"Prompt is not in content:\n{raw_content}")
+#         if len(content.strip()) == 0:
+#             raise ParseError(f"Prompt is not in content:\n{raw_content}")
 
-        return content
+#         return content
 
 
 async def post(session: aiohttp.ClientSession, url: str, headers=dict, body=dict):
-    try:
-        async with session.post(url=url, headers=headers, json=body) as response:
+    while True:
+        try:
+            async with session.post(url=url, headers=headers, json=body) as response:
 
-            if response.status != 200:
-                raise Exception(response.text)
+                if response.status != 200:
+                    raise Exception(response.text)
 
-            return await response.json()
-    except Exception as e:
-        print("Unable to get url {} due to {}.".format(url, e))
+                return await response.json()
+        except Exception as e:
+            print("Unable to get url {} due to {}.".format(url, e))
+            await asyncio.sleep(1)
+            continue
+
+
+async def call_replicate_api(session: aiohttp.ClientSession, prompt: str, temperature: float) -> str:
+
+    TOKEN = constants.REPLICATE_TOKEN
+
+    client = replicate.Client(api_token=TOKEN)
+
+    response = await client.async_run(
+        ref="lucataco/wizardcoder-15b-v1.0:b8c554180169aa3ea1c8b95dd6af4c24dd9e59dce55148c8f3654752aa641c87",
+        input={
+            "prompt": prompt,
+            "temperature": temperature,
+            "max_new_tokens": 512
+        },
+    )
+
+    return response
 
 
 async def call_anyscale_api(session: aiohttp.ClientSession, prompt: str, temperature: float) -> str:
 
-    BEARER = "esecret_pea3m6uymn3rlp1v57hmn3ctqc"
+    BEARER = constants.ANYSCALE_TOKEN
     url = "https://api.endpoints.anyscale.com/v1/chat/completions"
     body = {
         "model": "codellama/CodeLlama-34b-Instruct-hf",
@@ -309,6 +377,7 @@ async def call_anyscale_api(session: aiohttp.ClientSession, prompt: str, tempera
         "temperature": temperature,
         "max_tokens": 512,
         "top_p": 0.95,
+        "do_sample": True
     }
 
     response = await post(session,
@@ -414,10 +483,13 @@ class ApiWrapper:
             while True:
                 try:
                     async with aiohttp.ClientSession() as session:
-                        if LLM_TYPE == "WIZARD_CODER" or LLM_TYPE == "OCTOCODER" or LLM_TYPE == "CODE_LLAMA_7B":
+                        if LLM_TYPE == "WIZARD_CODER":
+                            content_list = await asyncio.gather(*[call_replicate_api(
+                                session, prompt, self.temperature) for _ in range(n)])
+                        elif LLM_TYPE in ["CODE_LLAMA_7B", "OCTOCODER"]:
                             content_list = await asyncio.gather(*[call_huggingface_api(
                                 session, self.endpoint_url, prompt, self.temperature) for _ in range(n)])
-                        if LLM_TYPE == "CODE_LLAMA":
+                        elif LLM_TYPE == "CODE_LLAMA":
                             content_list = await asyncio.gather(*[call_anyscale_api(
                                 session, prompt, self.temperature) for _ in range(n)])
 
@@ -426,22 +498,70 @@ class ApiWrapper:
                     print("API EXCEPTION:", e)
 
 
+def parse_prompt(prompt: str):
+    lines = prompt.splitlines(keepends=True)
+
+    docstring = ""
+    func_decl = ""
+    examples_docstring = ""
+    in_examples = False
+
+    for line in lines:
+
+        if line.startswith("/// Examples"):
+            in_examples = True
+            continue
+
+        if not in_examples and line.startswith("///"):
+            docstring += line
+
+        if in_examples and line.startswith("///"):
+            examples_docstring += line
+
+        if line.startswith("fn "):
+            func_decl += line
+
+    import re
+    pattern = re.compile(
+        r"fn\s(?P<func_name>[\w\_]*)[\<\(](.*?)\{", re.MULTILINE | re.DOTALL)
+
+    func_name = pattern.search(func_decl).group("func_name")
+    task_instruction = "".join(l[4:]
+                               for l in docstring.splitlines(keepends=True))
+
+    return {
+        "docstring": docstring,
+        "func_decl": func_decl,
+        "examples_docstring": examples_docstring,
+        "func_name": func_name,
+        "prompt": f"Write a Rust function `{func_decl}` for the following task: {task_instruction}"
+    }
+
+
+def do_skip_if_not_zero(idx: int, array: [int]) -> bool:
+    if array[idx] == 0:
+        return False
+
+    return True
+
+
 async def main():
     global LLM_TYPE
 
-    START_TASK = 0
+    START_TASK = 56
 
-    TIMES = 1
+    TIMES = 30
     VERBOSE = True
     LANGUAGE = "rust"
     TEMPERATURE = 0.2
     ENDPOINT_URL = None
-    SAMPLE_TYPE = "own"
+    SAMPLE_TYPE = "humaneval"  # "own"
     TASK = "humanevalsynthesize"
 
     RESULT_FILENAME = f"completions_{LANGUAGE}_{TASK}.jsonl"
     # RESULT_FILENAME = "/home/al9hu7/workspace/ma/generated-data/humaneval-rust-samples/completions_rust_humanevalsynthesize_codellama_instruct_34b_t0.2_tp0.95.jsonl"
     # RESULT_FILENAME = "/home/al9hu7/workspace/ma/generated-data/ownbenchmark-samples/completions_rust_ownbenchmark_gpt_4turbo_t0.8_tp0.95.jsonl"
+    # RESULT_FILENAME = "/home/al9hu7/workspace/ma/generated-data/humaneval-rust-samples/completions_rust_humanevalsynthesize_wizardcoder_t0.2_tp0.95.jsonl"
 
     import constants
     API_KEY = constants.OPENAI_KEY
@@ -450,11 +570,11 @@ async def main():
         ENDPOINT_URL = "https://xy32vdwpo5jeptys.us-east-1.aws.endpoints.huggingface.cloud"
     # octocoder
     if LLM_TYPE == "OCTOCODER":
-        ENDPOINT_URL = "https://faidngpb26hefmo4.us-east-1.aws.endpoints.huggingface.cloud"
+        # ENDPOINT_URL = "https://faidngpb26hefmo4.us-east-1.aws.endpoints.huggingface.cloud"
+        ENDPOINT_URL = "https://w1zpuf47j65gski5.us-east-1.aws.endpoints.huggingface.cloud"
         # ENDPOINT_URL = "https://me9rxdof1htyppbi.us-east-1.aws.endpoints.huggingface.cloud"
     if LLM_TYPE == "CODE_LLAMA_7B":
-        # ENDPOINT_URL = "https://b9al2eru8mdlz5uo.us-east-1.aws.endpoints.huggingface.cloud"
-        ENDPOINT_URL = ""
+        ENDPOINT_URL = "https://b9al2eru8mdlz5uo.us-east-1.aws.endpoints.huggingface.cloud"
 
     # Load descriptions
     if TASK == "humanevalexplainsynthesize":
@@ -472,12 +592,15 @@ async def main():
         task["entry_point"] = task["entry_point"]
         task["canonical_solution"] = task["canonical_solution"]
         task["instruction"] = task["instruction"] + \
-            "\n" + task["prompt"] + "\n" + task["helper"]
+            "\n" + task["prompt"] + "\n" + "```rust" + task["helper"] + "\n```"
         return task
 
     if SAMPLE_TYPE == "humaneval":
         tasks = [s for s in load_dataset(
             "bigcode/humanevalpack", LANGUAGE)["test"]]
+        tasks = [s for s in load_dataset(
+            "nuprl/MultiPL-E", "humaneval-rs")["test"]]
+
     elif SAMPLE_TYPE == "own":
         PATH = "/home/al9hu7/workspace/ma/generated-data/own-rust-benchmark/rust-benchmark.json"
         with open(PATH, "r") as f:
@@ -490,15 +613,15 @@ async def main():
             samples = [s for s in reader]
 
         # add missing tasks from benchmark
-        out_samples = []
-        tasks_iter = tasks.__iter__()
-        for line in samples:
-            out_samples.append(line)
-            tasks_iter.__next__()
-        for line in tasks_iter:
-            out_samples.append(line)
+        # out_samples = []
+        # tasks_iter = tasks.__iter__()
+        # for line in samples:
+        #     out_samples.append(line)
+        #     tasks_iter.__next__()
+        # for line in tasks_iter:
+        #     out_samples.append(line)
 
-        tasks = out_samples
+        tasks = samples
 
     # map from own benchmark to humaneval format
     if SAMPLE_TYPE == "own":
@@ -513,9 +636,13 @@ async def main():
 
     errors_per_sample = []
 
-    parser = ContentParser()
+    parser = RespParser(language="rust")
     for idx, task in enumerate(tqdm(tasks)):
-        if idx < START_TASK:
+
+        # if do_skip_if_not_zero(idx, [])):
+        #     continue
+
+        if START_TASK != 0 and idx < START_TASK:
             continue
 
         if TASK == "humanevalfix":
@@ -534,25 +661,38 @@ async def main():
             desc = descriptions[idx]
             prompt = get_prompt_explain_syn(task, desc, language=LANGUAGE)
         if VERBOSE:
+            task_id = task['task_id'] if "task_id" in task else "Rust/" + task["name"].split("_")[
+                1]
             print(
-                f"Processing {task['task_id']} ({idx + 1}/{len(tasks)}))...")
+                f"Processing {task_id} ({idx + 1}/{len(tasks)}))...")
+
+        task["raw_prompt"] = prompt
 
         task["raw_generation"] = await api_wrapper(prompt, TIMES)
+
+        entry_point = task["entry_point"] if "entry_point" in task else find_function_names(
+            task["prompt"])[0]
+
+        if "entry_point" not in task:
+            task["entry_point"] = entry_point
 
         parsed_samples = list()
         errors = 0
         for generation_item in task["raw_generation"]:
             try:
                 parsed_samples.append(
-                    parser(prompt, generation_item, task["entry_point"], False, LANGUAGE))
+                    parser(generation_item, entry_point, helper_decl="")[0])
             except ParseError as e:
                 errors += 1
                 parse_errors += 1
                 print("PARSE EXCEPTION:", e)
                 parsed_samples.append("")
 
+        task_id = task['task_id'] if "task_id" in task else "Rust/" + task["name"].split("_")[
+            1]
+
         errors_per_sample.append({
-            "task_id": task["task_id"],
+            "task_id": task_id,
             "errors": errors,
         })
 
@@ -560,10 +700,13 @@ async def main():
 
         if VERBOSE:
             for i in range(TIMES):
+                entry_point = task["entry_point"] if "entry_point" in task else find_function_names(
+                    task["prompt"])[0]
                 print(termcolor.colored(
-                    task["entry_point"], "yellow", attrs=["bold"]))
+                    entry_point, "yellow", attrs=["bold"]))
                 print(termcolor.colored(prompt, "yellow"))
-                print(termcolor.colored(task["canonical_solution"], "red"))
+                print(termcolor.colored(
+                    task["canonical_solution"] if "canonical_solution" in task else "-", "red"))
                 print(termcolor.colored(
                     task["generation"][i], "green")+"\n\n")
 
