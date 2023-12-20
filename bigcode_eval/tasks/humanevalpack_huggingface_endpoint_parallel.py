@@ -36,6 +36,7 @@ messages=messages
 """
 
 from importlib.metadata import entry_points
+from urllib import response
 from transformers import AutoTokenizer, AutoModelForCausalLM
 from peft import PeftConfig, PeftModel
 import os
@@ -74,7 +75,7 @@ LANGUAGE_TO_NAME = {
 }
 
 # "OCTOCODER", "CODE_LLAMA", "CODE_LLAMA_7B", "CODEGEN_RUST", "GPT", "WIZARD_CODER"
-LLM_TYPE = "CODE_LLAMA"
+LLM_TYPE = "GPT"
 
 
 def get_prompt_base(doc, language):
@@ -89,7 +90,7 @@ def get_prompt_base(doc, language):
     return prompt_base
 
 
-def get_prompt_synthesize(doc, language="python"):
+def get_prompt_synthesize(doc, language="python", prompt_type="prompt"):
     global LLM_TYPE
     # addon = f"Start your code with:\n{get_prompt_base(sample, language)}"
     # return doc["instruction"] + "\n" + addon # Results in worse performance for GPT4
@@ -123,7 +124,7 @@ def get_prompt_synthesize(doc, language="python"):
     #     def prompt_template(instruction: str, context: str, function_start: str) -> str:
     #         return f"{instruction}"
 
-    def get_prompt(prompt_type, prompt_base, instruction, context=None):
+    def get_prompt(prompt_type, prompt_base, instruction, context=None, prompt_type_prompt="prompt"):
 
         if context is None:
             inp = instruction
@@ -133,18 +134,27 @@ def get_prompt_synthesize(doc, language="python"):
         else:
             inp = instruction + "\n" + context
 
-        if prompt_type == "continue":
+        if prompt_type == "GPT":
+            if prompt_type_prompt == "instruction":
+                prompt = instruction.strip()
+            elif prompt_type_prompt == "prompt":
+                prompt = prompt_base
+        elif prompt_type == "continue":
             assert context is None, "The `continue` prompt should only be used for HumanEvalSynthesize. Use `instruct` for HumanEvalFix and HumanEvalExplain."
             prompt = prompt_base
         elif prompt_type == "instruct":
             prompt = inp + "\n\n" + prompt_base
         elif prompt_type in ["CODE_LLAMA", "CODE_LLAMA_7B"]:
-            system = "Provide answers in Rust. Your code should start with ```rust and end with ```."
+            # system = "Provide answers in Rust. Your code should start with ```rust and end with ```."
             # user = f"You are an expert Rust programmer, and here is your task: {inp}\nYour code should start with ```rust and end with ```."
             # user = prompt_base
             # prompt = f"<s>[INST] <<SYS>>\\n{system}\\n<</SYS>>\\n\\n{user}[/INST]"
-            inp = prompt_base
-            prompt = f"You are an expert Rust programmer. Write a idiomatic Rust function to complete the following prompt. Your code should start with ```rust and end with ```.\n{inp}"
+            # inp = prompt_base
+            # prompt = f"You are an expert Rust programmer. Write a idiomatic Rust function to complete the following prompt. Your code should start with ```rust and end with ```.\n{inp}"
+            if prompt_type_prompt == "instruction":
+                prompt = f"<s>[INST] {instruction.strip()} [/INST]"
+            elif prompt_type_prompt == "prompt":
+                prompt = prompt_base
         elif prompt_type == "OCTOCODER":
             prompt = f'Question: {inp}\n\nAnswer:\n{prompt_base}'
         elif prompt_type == "octogeex":
@@ -165,7 +175,7 @@ def get_prompt_synthesize(doc, language="python"):
 
         return prompt
 
-    return get_prompt(LLM_TYPE, doc["prompt"], doc["instruction"] if "instruction" in doc else "", "").strip()
+    return get_prompt(LLM_TYPE, doc["prompt"], doc["instruction"], "", prompt_type)
 
 
 def get_base_prompt_fix(doc, language="python", mode="tests"):
@@ -212,128 +222,6 @@ def get_prompt_explain_syn(sample, desc, language="python"):
     return desc + "\n" + instruction + "\n" + addon
 
 
-# class ParseError(Exception):
-#     pass
-
-
-# class ContentParser:
-
-#     @staticmethod
-#     def _entry_point_variations(entry_point: str) -> List[str]:
-#         # NOTE: workaround dataset's bug with entry point naming
-#         return [
-#             entry_point,
-#             to_snake(entry_point),
-#             entry_point[0].lower() + entry_point[1:],
-#         ]
-
-#     def __call__(self, prompt: str, content: str, entry_point: str, func_start_in_prompt: bool = True, language: str = "python"):
-#         raw_content = content
-
-#         content = content.replace(prompt, "", 1)
-
-#         # remove comments
-#         content = "".join(filter(lambda x: not x.startswith(
-#             "//"), content.splitlines(keepends=True)))
-
-#         if "```" in content:
-#             content = content.split("```")[1]
-#         # first parse with assumption that content has description
-#         # matcher = CSequenceMatcher(None, prompt, content)
-#         # tag, _, _, j1, j2 = matcher.get_opcodes()[-1]
-#         # if tag == "insert":
-#         #     return content[j1:j2]
-#         # second parse content with assumption that model wrote code without description
-
-#         if not func_start_in_prompt:
-#             # split at func start
-#             for entry_point in self._entry_point_variations(entry_point):
-#                 if entry_point in content:
-#                     if language == "python":
-#                         func_prefix = "def"
-#                     elif language == "rust":
-#                         func_prefix = "fn"
-
-#                     parts = content.split(f"{func_prefix} {entry_point}")
-#                     if len(parts) > 1:
-#                         content = "".join(
-#                             parts[1].splitlines(keepends=True)[1:])
-
-#                     parts = content.split(f"{func_prefix} main")
-#                     if len(parts) > 1:
-#                         content = parts[0]
-
-#         if language == "python":
-#             content_lines = content.splitlines(keepends=True)[1:]
-#             func_lines = []
-#             for line in content_lines:
-#                 if line.startswith("    ") or line.startswith("\n"):
-#                     func_lines.append(line)
-#                 else:
-#                     break
-#             content = "".join(func_lines)
-#         elif language == "rust":
-#             start_idx = 0
-#             end_idx = 0
-#             open_brackets = 1
-#             in_string = False
-#             in_char_string = False
-#             char_str_len = 0
-#             content_out = ""
-#             in_func = True
-#             cycle_buf = ""
-#             wait_for_func_start = False
-
-#             for idx, char in enumerate(content):
-#                 if in_func:
-#                     last_was_escape = len(
-#                         cycle_buf) == 0 or not cycle_buf[-1] == "\\"
-
-#                     if not in_char_string and not last_was_escape and char == '"':
-#                         in_string = not in_string
-
-#                     if not in_string and not not last_was_escape and char == "'":
-#                         char_str_len = 0
-#                         in_char_string = not in_char_string
-
-#                     if in_char_string:
-#                         char_str_len += 1
-#                         if char_str_len == 3:
-#                             in_char_string = False
-#                             char_str_len = 0
-
-#                     if not in_string and not in_char_string:
-#                         if char == '{':
-#                             open_brackets += 1
-#                         elif char == '}':
-#                             open_brackets -= 1
-
-#                     if open_brackets == 0:
-#                         end_idx = idx
-#                         in_func = False
-#                 else:
-#                     if cycle_buf[-2:] + char == "\nfn":
-#                         wait_for_func_start = True
-
-#                     if wait_for_func_start and char == "{":
-#                         open_brackets += 1
-#                         wait_for_func_start = False
-#                         in_func = True
-
-#                 content_out += char
-
-#                 if len(cycle_buf) > 3:
-#                     cycle_buf = cycle_buf[1:]
-#                 cycle_buf += char
-
-#             content = content_out[start_idx:end_idx + 1]
-
-#         if len(content.strip()) == 0:
-#             raise ParseError(f"Prompt is not in content:\n{raw_content}")
-
-#         return content
-
-
 async def post(session: aiohttp.ClientSession, url: str, headers=dict, body=dict):
     while True:
         try:
@@ -345,7 +233,7 @@ async def post(session: aiohttp.ClientSession, url: str, headers=dict, body=dict
                 return await response.json()
         except Exception as e:
             print("Unable to get url {} due to {}.".format(url, e))
-            await asyncio.sleep(1)
+            await asyncio.sleep(5)
             continue
 
 
@@ -370,20 +258,45 @@ async def call_replicate_api(session: aiohttp.ClientSession, prompt: str, temper
 async def call_anyscale_api(session: aiohttp.ClientSession, prompt: str, temperature: float) -> str:
 
     BEARER = constants.ANYSCALE_TOKEN
-    url = "https://api.endpoints.anyscale.com/v1/chat/completions"
-    body = {
-        "model": "codellama/CodeLlama-34b-Instruct-hf",
-        "messages": [{"role": "user", "content": prompt}],
-        "temperature": temperature,
-        "max_tokens": 512,
-        "top_p": 0.95,
-        "do_sample": True
+
+    client = openai.AsyncClient(
+        base_url="https://api.endpoints.anyscale.com/v1",
+        api_key=BEARER
+    )
+
+    response = await client.completions.create(
+        model="codellama/CodeLlama-34b-Instruct-hf",
+        prompt=prompt,
+        temperature=temperature,
+        max_tokens=512,
+        top_p=0.95,
+        seed=0,
+    )
+
+    return response.choices[0].text
+
+
+async def call_run_pod(session: aiohttp.ClientSession, model: str, url: str, prompt: str, temperature: str) -> [str]:
+
+    headers = {
+        # "authorization": f"Bearer {BEARER}",
+        "Content-Type": "application/json"
     }
 
-    response = await post(session,
-                          url, headers={"Authorization": f"Bearer {BEARER}"}, body=body)
+    body = {
+        "model": model,
+        "prompt": prompt,
+        "max_tokens": 512,
+        "temperature": temperature,
+        "top_p": 0.95,
+        "do_sample": True,
+        "seed": 0,
+        "add_bos_token": False,
+    }
 
-    return response["choices"][0]["message"]["content"]
+    response = await post(session, url, headers=headers, body=body)
+
+    return response["choices"][0]["text"]
 
 
 async def call_huggingface_api(session: aiohttp.ClientSession, url: str, prompt: str, temperature: str) -> str:
@@ -398,11 +311,9 @@ async def call_huggingface_api(session: aiohttp.ClientSession, url: str, prompt:
         "parameters": {
             "top_p": 0.95,
             "temperature": temperature,
-            "repetition_penalty": 1.15,
             "max_new_tokens": 512,
             "do_sample": True,
-            "max_time": None,
-            "return_full_text": False,
+            "seed": 0
         },
         "options": {
             "use_cache": False,
@@ -486,7 +397,10 @@ class ApiWrapper:
                         if LLM_TYPE == "WIZARD_CODER":
                             content_list = await asyncio.gather(*[call_replicate_api(
                                 session, prompt, self.temperature) for _ in range(n)])
-                        elif LLM_TYPE in ["CODE_LLAMA_7B", "OCTOCODER"]:
+                        elif LLM_TYPE == "CODE_LLAMA_7B":
+                            content_list = list([await call_run_pod(
+                                session, "codellama/CodeLlama-7b-Instruct-hf", self.endpoint_url, prompt, self.temperature) for _ in range(n)])
+                        elif LLM_TYPE in ["OCTOCODER"]:
                             content_list = await asyncio.gather(*[call_huggingface_api(
                                 session, self.endpoint_url, prompt, self.temperature) for _ in range(n)])
                         elif LLM_TYPE == "CODE_LLAMA":
@@ -548,17 +462,18 @@ def do_skip_if_not_zero(idx: int, array: [int]) -> bool:
 async def main():
     global LLM_TYPE
 
-    START_TASK = 56
+    START_TASK = 0
 
-    TIMES = 30
+    TIMES = 1
     VERBOSE = True
     LANGUAGE = "rust"
     TEMPERATURE = 0.2
     ENDPOINT_URL = None
-    SAMPLE_TYPE = "humaneval"  # "own"
+    SAMPLE_TYPE = "own"  # "humaneval", "own"
     TASK = "humanevalsynthesize"
+    PROMPT_TYPE = "instruction"  # "prompt", "instruction"
 
-    RESULT_FILENAME = f"completions_{LANGUAGE}_{TASK}.jsonl"
+    RESULT_FILENAME = f"completions_rust_own_bench_gpt4_turbo_{PROMPT_TYPE}.jsonl"
     # RESULT_FILENAME = "/home/al9hu7/workspace/ma/generated-data/humaneval-rust-samples/completions_rust_humanevalsynthesize_codellama_instruct_34b_t0.2_tp0.95.jsonl"
     # RESULT_FILENAME = "/home/al9hu7/workspace/ma/generated-data/ownbenchmark-samples/completions_rust_ownbenchmark_gpt_4turbo_t0.8_tp0.95.jsonl"
     # RESULT_FILENAME = "/home/al9hu7/workspace/ma/generated-data/humaneval-rust-samples/completions_rust_humanevalsynthesize_wizardcoder_t0.2_tp0.95.jsonl"
@@ -575,6 +490,11 @@ async def main():
         # ENDPOINT_URL = "https://me9rxdof1htyppbi.us-east-1.aws.endpoints.huggingface.cloud"
     if LLM_TYPE == "CODE_LLAMA_7B":
         ENDPOINT_URL = "https://b9al2eru8mdlz5uo.us-east-1.aws.endpoints.huggingface.cloud"
+        ENDPOINT_URL = "https://b9al2eru8mdlz5uo.us-east-1.aws.endpoints.huggingface.cloud"
+
+        POD_ID = "m1ashbwwphz9qj"
+        POD_URL = f"https://{POD_ID}-5000.proxy.runpod.net/"
+        ENDPOINT_URL = f"{POD_URL}v1/completions"
 
     # Load descriptions
     if TASK == "humanevalexplainsynthesize":
@@ -584,48 +504,35 @@ async def main():
     openai.organization = os.getenv("OPENAI_ORGANIZATION")
     openai.api_key = os.getenv("OPENAI_API_KEY")
 
-    def tasks_mapper(task):
-        task["task_id"] = f"Rust/{task['task_id']}" if isinstance(
-            task["task_id"], int) else task["task_id"]
-        task["declaration"] = task["declaration"]
-        task["test"] = task["test"]
-        task["entry_point"] = task["entry_point"]
-        task["canonical_solution"] = task["canonical_solution"]
-        task["instruction"] = task["instruction"] + \
-            "\n" + task["prompt"] + "\n" + "```rust" + task["helper"] + "\n```"
-        return task
-
-    if SAMPLE_TYPE == "humaneval":
-        tasks = [s for s in load_dataset(
-            "bigcode/humanevalpack", LANGUAGE)["test"]]
-        tasks = [s for s in load_dataset(
-            "nuprl/MultiPL-E", "humaneval-rs")["test"]]
-
-    elif SAMPLE_TYPE == "own":
-        PATH = "/home/al9hu7/workspace/ma/generated-data/own-rust-benchmark/rust-benchmark.json"
-        with open(PATH, "r") as f:
-            import json
-            tasks = json.load(f)
-
     # start at a specific task from already sampled file
-    if START_TASK > 0:
+    if START_TASK > 0 or True:
         with jsonlines.open(RESULT_FILENAME, "r") as reader:
             samples = [s for s in reader]
 
-        # add missing tasks from benchmark
-        # out_samples = []
-        # tasks_iter = tasks.__iter__()
-        # for line in samples:
-        #     out_samples.append(line)
-        #     tasks_iter.__next__()
-        # for line in tasks_iter:
-        #     out_samples.append(line)
+        if SAMPLE_TYPE == "humaneval":
+            BENCHMARK_FILE = "/home/al9hu7/workspace/ma/generated-data/benchmarks/merged_humaneval-pack_multipl-e/rust-benchmark.jsonl"
+            tasks = [s for s in jsonlines.open(BENCHMARK_FILE, "r")]
+
+        elif SAMPLE_TYPE == "own":
+            BENCHMARK_FILE = "/home/al9hu7/workspace/ma/generated-data/benchmarks/own-rust-benchmark/rust-benchmark.jsonl"
+            tasks = [s for s in jsonlines.open(BENCHMARK_FILE, "r")]
+
+        for (sample, task) in zip(samples, tasks):
+            sample["prompt"] = task["prompt"]
+            sample["instruction"] = task["instruction"]
+            sample["canonical_solution"] = task["canonical_solution"]
+            sample["entry_point"] = task["entry_point"]
+            sample["test"] = task["test"]
 
         tasks = samples
+    else:
+        if SAMPLE_TYPE == "humaneval":
+            BENCHMARK_FILE = "/home/al9hu7/workspace/ma/generated-data/benchmarks/merged_humaneval-pack_multipl-e/rust-benchmark.jsonl"
+            tasks = [s for s in jsonlines.open(BENCHMARK_FILE, "r")]
 
-    # map from own benchmark to humaneval format
-    if SAMPLE_TYPE == "own":
-        tasks = list(map(tasks_mapper, tasks))
+        elif SAMPLE_TYPE == "own":
+            BENCHMARK_FILE = "/home/al9hu7/workspace/ma/generated-data/benchmarks/own-rust-benchmark/rust-benchmark.jsonl"
+            tasks = [s for s in jsonlines.open(BENCHMARK_FILE, "r")]
 
     if LLM_TYPE == "CODEGEN_RUST":
         api_wrapper = CodegenRustModel(TEMPERATURE)
@@ -636,19 +543,31 @@ async def main():
 
     errors_per_sample = []
 
-    parser = RespParser(language="rust")
+    parser = RespParser(starts_with_function=True if PROMPT_TYPE ==
+                        "prompt" else False, collect_imports_into_func_body=True if PROMPT_TYPE == "instruction" else False, language="rust")
     for idx, task in enumerate(tqdm(tasks)):
-
         # if do_skip_if_not_zero(idx, [])):
         #     continue
 
         if START_TASK != 0 and idx < START_TASK:
             continue
 
+        task_id = task['task_id'] if "task_id" in task else "Rust/" + \
+            task["name"].split("_")[1]
+
+        task_idx = int(task_id.split("/")[1])
+
+        # sample only the given tasks
+        # [115, 160, 74, 109, 129, 91, 46, 78, 94, 28, 81]
+        # if task_idx not in [84, 91]:
+        if task_idx not in [32]:
+            continue
+
         if TASK == "humanevalfix":
             prompt = get_prompt_fix(task, language=LANGUAGE, mode="tests")
         elif TASK == "humanevalsynthesize":
-            prompt = get_prompt_synthesize(task, language=LANGUAGE)
+            prompt = get_prompt_synthesize(
+                task, language=LANGUAGE, prompt_type=PROMPT_TYPE)
         elif TASK == "humanevalexplaindescribe":
             prompt, docstring_len = get_prompt_explain_desc(
                 task, language=LANGUAGE)
@@ -661,8 +580,6 @@ async def main():
             desc = descriptions[idx]
             prompt = get_prompt_explain_syn(task, desc, language=LANGUAGE)
         if VERBOSE:
-            task_id = task['task_id'] if "task_id" in task else "Rust/" + task["name"].split("_")[
-                1]
             print(
                 f"Processing {task_id} ({idx + 1}/{len(tasks)}))...")
 

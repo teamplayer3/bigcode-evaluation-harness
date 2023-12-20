@@ -45,7 +45,7 @@ def extract_func_body(inp: str) -> str:
         cycle_buf += char
 
     if open_brackets != 0:
-        raise ParseError("Function body not closed")
+        raise ParseError(f"Function body not closed: input {inp}")
 
     return inp[0:end_idx + 1]
 
@@ -152,15 +152,19 @@ def extract_full_code_blocks(inp: str) -> [str]:
 
 class RespParser:
 
-    def __init__(self, remove_entry_func_head: bool = True, pretend_entry_func_included: bool = True, collect_imports_into_func_body: bool = False, multiple_samples: bool = False, language: str = "rust") -> None:
+    def __init__(self, starts_with_function: bool = False, remove_entry_func_head: bool = True, pretend_entry_func_included: bool = True, collect_imports_into_func_body: bool = False, multiple_samples: bool = False, language: str = "rust") -> None:
         self.language = language
         self.remove_entry_func_head = remove_entry_func_head
         self.pretend_entry_func_included = pretend_entry_func_included
         self.collect_imports_into_func_body = collect_imports_into_func_body
         self.multiple_samples = multiple_samples
+        self.starts_with_function = starts_with_function
 
     def __call__(self, response: str, entry_point: str, helper_decl: str) -> [str]:
         content = response
+
+        if self.starts_with_function:
+            content = extract_func_body(content)
 
         # remove comments
         if self.language == "rust":

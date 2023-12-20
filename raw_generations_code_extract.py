@@ -48,12 +48,12 @@ PATH = "./"
 # FILE_NAME = "completions_rust_ownbenchmark_codellame_instruct_34b_t0.2_tp0.95"
 # FILE_NAME = "completions_rust_humanevalsynthesize_wizardcoder_t0.2_tp0.95"
 # FILE_NAME = "completions_rust_humanevalsynthesize_gpt_4turbo_t0.8_tp0.95"
-FILE_NAME = "completions_rust_humanevalsynthesize"
+FILE_NAME = "completions_rust_multiple_gpt4_turbo_instruction"
 # FILE_NAME = "completions_rust_ownbenchmark_gpt_4turbo_t0.8_tp0.95"
 
 
 content_parser = RespParser(
-    collect_imports_into_func_body=True, multiple_samples=False, language="rust")
+    collect_imports_into_func_body=True, starts_with_function=False, remove_entry_func_head=False, multiple_samples=False, pretend_entry_func_included=True, language="rust")
 
 errors_per_sample = []
 
@@ -61,7 +61,7 @@ with jsonlines.open(f"{PATH}{FILE_NAME}.jsonl") as reader:
     with jsonlines.open(f"{PATH}{FILE_NAME}_conf.jsonl", mode="w") as writer:
         parse_errors = 0
         samples = 0
-        for line in reader:
+        for idx, line in enumerate(reader):
             if "raw_generation" not in line:
                 continue
 
@@ -85,7 +85,7 @@ with jsonlines.open(f"{PATH}{FILE_NAME}.jsonl") as reader:
                 except ParseError as e:
                     parse_errors += 1
                     errors += 1
-                    if task_id == "Rust/46":
+                    if task_id == "Rust/33":
                         print(e)
                     parsed.append("")
 

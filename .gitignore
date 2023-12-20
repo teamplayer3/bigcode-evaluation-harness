@@ -170,3 +170,4 @@ generations*.json
 playground/
 model-cache/
 constants.py
+tmp/
